@@ -16,6 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  BASELINE_REF: dev
   PYTHONDEVMODE: "1"
   PYTHONUNBUFFERED: "1"
   PYTHONPATH: "" # explicit cleanup
@@ -56,20 +57,30 @@ jobs:
           exit 1
 
   pr-regression:
-    name: Performance regression test between PR and main
+    name: Performance regression test between PR and dev (${{ matrix.runner.toolkit }})
     needs: [permissions-check]
     runs-on: ${{ matrix.runner.tags }}
     strategy:
       matrix:
         runner:
-          - tags: [self-hosted, nvidia]
-            name: self-hosted-nvidia
-            toolkit: CUDA-12.8
+          # - tags: [self-hosted, nvidia]
+          #   name: self-hosted-nvidia
+          #   toolkit: CUDA-12.8
+          - tags: tilelang-metax-runner
+            name: self-hosted-metax
+            toolkit: MACA-3.6
         python-version:
           - "3.12"
       fail-fast: false
     timeout-minutes: 120
     steps:
+      - name: Install dependencies for runner (MetaX)
+        if: contains(matrix.runner.toolkit, 'MACA')
+        run: |
+          sudo apt-get update && sudo apt-get install -y git ccache
+          export PATH="/opt/conda/bin:${PATH}"
+          echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
+
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
@@ -147,6 +158,23 @@ jobs:
             echo "::warning::nvcc not found in PATH!"
           fi
 
+      - name: Set environment (MACA)
+        if: contains(matrix.runner.toolkit, 'MACA')
+        run: |
+          TOOLKIT="${{ matrix.runner.toolkit }}"
+          export UV_INDEX="http://mirrors.aliyun.com/pypi/simple"
+          export CLANG_TIDY_CMAKE_OPTIONS="${CLANG_TIDY_CMAKE_OPTIONS} -DUSE_MACA=ON"
+
+          echo "USE_MACA=ON" | tee -a "${GITHUB_ENV}"
+          echo "UV_INDEX=${UV_INDEX}" | tee -a "${GITHUB_ENV}"
+          echo "CLANG_TIDY_CMAKE_OPTIONS=${CLANG_TIDY_CMAKE_OPTIONS}" | tee -a "${GITHUB_ENV}"
+
+          if [[ -x "$(command -v mxcc)" ]]; then
+            echo "\$ $(command -v mxcc) --version" && mxcc --version
+          else
+            echo "::warning::mxcc not found in PATH!"
+          fi
+
       - name: Setup Python and uv with caching
         id: setup-uv
         uses: astral-sh/setup-uv@v7
@@ -173,25 +201,45 @@ jobs:
           uv venv --python "${{ matrix.python-version }}" new
 
           source new/bin/activate
+
+          if [[ "${{ matrix.runner.toolkit }}" == *"MACA"* ]]; then
+            cp -rf /opt/conda/lib/python3.12/site-packages/* new/lib/python3.12/site-packages/
+          fi
           uv pip install -v -r requirements-test.txt
+          if [[ "${{ matrix.runner.toolkit }}" == *"MACA"* ]]; then
+            uv pip install -v --no-deps --python-version 3.10.0 flash_linear_attention==0.4.0+metax3.5.3.9torch2.8 -i https://repos.metax-tech.com/r/maca-pypi/simple --trusted-host repos.metax-tech.com
+          fi
           uv pip install -v .
 
-      - name: Install Main version (Baseline)
+      - name: Install dev branch (Baseline)
         run: |
           set -e
           git clean -dxf -e new/ -e .cache/
-          git checkout main
+          git fetch origin "${BASELINE_REF}"
+          git checkout "origin/${BASELINE_REF}"
           git submodule update --init --recursive
           uv venv --python "${{ matrix.python-version }}" old
           source old/bin/activate
 
+          if [[ "${{ matrix.runner.toolkit }}" == *"MACA"* ]]; then
+            cp -rf /opt/conda/lib/python3.12/site-packages/* old/lib/python3.12/site-packages/
+          fi
           uv pip install -v -r requirements-test.txt
+          if [[ "${{ matrix.runner.toolkit }}" == *"MACA"* ]]; then
+            uv pip install -v --no-deps --python-version 3.10.0 flash_linear_attention==0.4.0+metax3.5.3.9torch2.8 -i https://repos.metax-tech.com/r/maca-pypi/simple --trusted-host repos.metax-tech.com
+          fi
           uv pip install -v .
           rm -rf tilelang build
 
           uv venv --python "${{ matrix.python-version }}" test_regression
           source test_regression/bin/activate
+          if [[ "${{ matrix.runner.toolkit }}" == *"MACA"* ]]; then
+            cp -rf /opt/conda/lib/python3.12/site-packages/* test_regression/lib/python3.12/site-packages/
+          fi
           uv pip install -v -r requirements-test.txt
+          if [[ "${{ matrix.runner.toolkit }}" == *"MACA"* ]]; then
+            uv pip install -v --no-deps --python-version 3.10.0 flash_linear_attention==0.4.0+metax3.5.3.9torch2.8 -i https://repos.metax-tech.com/r/maca-pypi/simple --trusted-host repos.metax-tech.com
+          fi
 
       - name: Clear uv cache for self-hosted runners (if setup failed)
         if: >-

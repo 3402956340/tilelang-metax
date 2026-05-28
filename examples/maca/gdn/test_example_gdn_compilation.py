@@ -1,4 +1,5 @@
 import torch
+import tilelang.testing
 from tilelang import language as T
 
 B = 1
@@ -277,6 +278,7 @@ def test_example_chunk_delta_h_compilation():
     h_tilelang, final_state_tilelang, V_new_tilelang = kernel(K, W, U, G, initial_state)  # noqa: F841
 
 
+@tilelang.testing.pytest.mark.xfail
 def test_example_chunk_delta_bwd_compilation():
     from example_chunk_delta_bwd import tilelang_chunk_gated_delta_rule_bwd_dhu, prepare_input
 

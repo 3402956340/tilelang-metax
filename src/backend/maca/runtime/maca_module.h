@@ -26,12 +26,9 @@
 
 #include <tvm/runtime/module.h>
 
-#include <memory>
 #include <string>
-#include <unordered_map>
-#include <vector>
 
-#include "runtime/meta_data.h"
+#include "runtime/metadata.h"
 
 namespace tvm {
 namespace runtime {
@@ -48,7 +45,7 @@ static constexpr const int kMaxNumGPUs = 32;
  * \param maca_source Optional, maca source file
  */
 ffi::Module MACAModuleCreate(std::string data, std::string fmt,
-                             std::unordered_map<std::string, FunctionInfo> fmap,
+                             ffi::Map<ffi::String, FunctionInfo> fmap,
                              std::string maca_source);
 } // namespace runtime
 } // namespace tvm

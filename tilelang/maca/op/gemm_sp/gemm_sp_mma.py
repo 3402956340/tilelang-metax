@@ -4,18 +4,18 @@ from tilelang.maca.intrinsics.macro.mma_sp_macro_generator import SparseTensorCo
 from tilelang.utils.language import is_shared, is_fragment
 from tilelang import tvm as tvm
 from tvm.target import Target
-from tvm import tir
+from tvm import tirx
 from tilelang import language as T
 from tilelang.transform.simplify import _Simplify
 
 
-GEMM_SP_INST_MMA = "maca.mma"
+GEMM_SP_INST_MMA_SP = "maca.mma.sp"
 
 
 class GemmSPMMA(GemmSPBase):
     def infer_layout(self, target: Target, thread_nums: int):
         # NOTE(wt): Actually gemm_sp v2 currently use GemmWarpPolicy
-        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GEMM_SP_INST_MMA)
+        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GEMM_SP_INST_MMA_SP)
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
         mma_emitter = SparseTensorCoreIntrinEmitter(
@@ -59,9 +59,9 @@ class GemmSPMMA(GemmSPBase):
         else:
             raise ValueError(f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}")
 
-    def lower(self, target: Target, thread_nums: int, thread_var: tir.Var):
+    def lower(self, layout_map: dict, target: Target, thread_nums: int, thread_var: tirx.Var):
         # NOTE(wt): Actually gemm_sp v2 currently use GemmWarpPolicy
-        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GEMM_SP_INST_MMA)
+        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GEMM_SP_INST_MMA_SP)
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
         mma_emitter = SparseTensorCoreIntrinEmitter(
@@ -103,7 +103,6 @@ class GemmSPMMA(GemmSPBase):
                 accumulating into C_local.
                 """
                 A_local = T.alloc_local((warp_rows * local_size_a), in_dtype)
-                E_local = T.alloc_local((warp_rows * local_size_e), self.e_dtype)
                 B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
 
                 if clear_accum:
@@ -114,12 +113,6 @@ class GemmSPMMA(GemmSPBase):
                     mma_emitter.ldmatrix_a(
                         A_local,
                         A_shared,
-                        ki,
-                    )
-
-                    # Load E into fragment
-                    mma_emitter.ldmatrix_e(
-                        E_local,
                         E_shared,
                         ki,
                     )
@@ -132,7 +125,7 @@ class GemmSPMMA(GemmSPBase):
                     )
 
                     # Perform Matrix Multiplication
-                    mma_emitter.mma_sp(A_local, E_local, B_local, C_local, ki)
+                    mma_emitter.mma(A_local, B_local, C_local, ki)
 
             # Simplify to optimize the index computing
             # Must inline let statements to simplify the analysis

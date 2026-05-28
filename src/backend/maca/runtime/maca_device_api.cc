@@ -21,7 +21,6 @@
  * \file maca_device_api.cc
  * \brief GPU specific API
  */
-#include <dmlc/thread_local.h>
 #include <mcc/mcc_global.h>
 #include <mcr/mc_runtime_api.h>
 #include <mxc/mxc.h>
@@ -29,7 +28,8 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/device_api.h>
-#include <tvm/runtime/profiling.h>
+#include <tvm/runtime/logging.h>
+#include <tvm/runtime/timer.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -149,7 +149,8 @@ public:
   }
   void *AllocDataSpace(Device dev, size_t nbytes, size_t alignment,
                        DLDataType type_hint) final {
-    ICHECK_EQ(256 % alignment, 0U) << "MACA space is aligned at 256 bytes";
+    TVM_FFI_ICHECK_EQ(256 % alignment, 0U)
+        << "MACA space is aligned at 256 bytes";
     void *ret;
     if (dev.device_type == kDLMACAHost) {
       VLOG(1) << "allocating " << nbytes << "bytes on host";
@@ -258,12 +259,11 @@ private:
   }
 };
 
-typedef dmlc::ThreadLocalStore<MACAThreadEntry> MACAThreadStore;
-
 MACAThreadEntry::MACAThreadEntry() : pool(kDLMACA, MACADeviceAPI::Global()) {}
 
 MACAThreadEntry *MACAThreadEntry::ThreadLocal() {
-  return MACAThreadStore::Get();
+  static thread_local MACAThreadEntry inst;
+  return &inst;
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

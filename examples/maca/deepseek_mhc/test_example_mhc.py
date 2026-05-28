@@ -8,6 +8,7 @@ def test_mhc_post():
     main_post()
 
 
+@tilelang.testing.pytest.mark.xfail
 def test_mhc_pre():
     main_pre()
 

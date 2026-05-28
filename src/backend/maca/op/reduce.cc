@@ -12,7 +12,7 @@
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 namespace maca {
 
@@ -20,6 +20,8 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
   static bool SupportsFp16Bf16NanReduce(Target target) {
     return TargetIsMaca(target);
   }
+
+  static int GetPreferedVectorizedSize(DataType dt, Target target) { return 1; }
 
   static std::string MakeBatchAllReduce(std::string reducer,
                                         int reducing_threads, int scale,

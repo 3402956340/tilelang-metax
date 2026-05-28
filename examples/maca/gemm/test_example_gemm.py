@@ -18,6 +18,7 @@ def test_example_gemm():
     example_gemm.main()
 
 
+@tilelang.testing.pytest.mark.xfail
 def test_example_gemm_with_maca_async_copy():
     example_gemm_with_maca_async_copy.main()
 

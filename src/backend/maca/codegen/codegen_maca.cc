@@ -6,11 +6,10 @@
  */
 
 #include "codegen_maca.h"
-#include "target/codegen_utils.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
-#include <tvm/tir/index_map.h>
-#include <tvm/tir/op.h>
+#include <tvm/tirx/index_map.h>
+#include <tvm/tirx/op.h>
 
 #include <cmath>
 #include <string>
@@ -214,21 +213,16 @@ private:
 
 CodeGenTileLangMACA::CodeGenTileLangMACA() {
   restrict_keyword_ = "__restrict__";
-  vid_global_barrier_state_ =
-      name_supply_->FreshName(runtime::symbol::tvm_global_barrier_state);
-  vid_global_barrier_expect_ = name_supply_->FreshName("__barrier_expect");
-  ICHECK_EQ(vid_global_barrier_state_,
-            runtime::symbol::tvm_global_barrier_state);
 }
 
 void CodeGenTileLangMACA::PrintFuncPrefix(std::ostream &os) {
   os << "extern \"C\" __global__ ";
 }
 
-class LaunchConfigExtractor : public tir::StmtVisitor {
+class LaunchConfigExtractor : public tirx::StmtVisitor {
 private:
   void VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::thread_extent) {
+    if (op->attr_key == tirx::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       if (iv->var->name_hint == "threadIdx.x" ||
           iv->thread_tag == "threadIdx.x") {
@@ -255,7 +249,7 @@ public:
   int64_t min_blocks_per_sm = 1; // default to 1
 };
 
-class ClusterInfoExtractor : public tir::StmtVisitor {
+class ClusterInfoExtractor : public tirx::StmtVisitor {
 private:
   void VisitStmt(const PrimFunc &f) {
     if (f->GetAttr<Array<PrimExpr>>("cluster_dims").has_value()) {
@@ -354,18 +348,13 @@ std::string CodeGenTileLangMACA::Finish() {
   //  decl_stream << "#ifdef ENABLE_BF16\n";
   //  decl_stream << "#include <tl_templates/maca/maca_bf16_fallbacks.cuh>\n";
   //  decl_stream << "#endif\n";
-
-  if (need_global_barrier_) {
-    decl_stream << "__device__ unsigned " << vid_global_barrier_state_
-                << " = 0;\n";
-  }
   decl_stream << "\n";
 
   return CodeGenC::Finish();
 }
 
-void CodeGenTileLangMACA::VisitStmt_(const tir::ForNode *op) {
-  if (op->kind == tir::ForKind::kUnrolled) {
+void CodeGenTileLangMACA::VisitStmt_(const tirx::ForNode *op) {
+  if (op->kind == tirx::ForKind::kUnrolled) {
     PrintIndent();
     if (unroll_factor.count(op->loop_var.get())) {
       stream << "#pragma unroll "
@@ -992,35 +981,7 @@ void CodeGenTileLangMACA::PrintStorageSync(const CallNode *op) {
                  << args.size();
     }
   } else if (sync == "global") {
-    if (!need_global_barrier_) {
-      need_global_barrier_ = true;
-    }
-    // global synchronizer
-    std::string is_load = PrintExpr(op->args[1]);
-    std::string num_blocks = PrintExpr(op->args[2]);
-    this->PrintIndent();
-    // In theory only threadfence is needed
-    // but we observed problems with only threadfence
-    this->stream << "__threadfence_system();\n";
-    this->PrintIndent();
-    this->stream << "if (" << is_load << ") {\n";
-    int wb = this->BeginScope();
-    this->PrintIndent();
-    this->stream << "atomicAdd(&" << vid_global_barrier_state_ << ", 1);\n";
-    this->PrintIndent();
-    std::string ptr = name_supply_->FreshName("pf");
-    this->stream << "volatile unsigned* " << ptr << " = &"
-                 << vid_global_barrier_state_ << ";\n";
-    this->PrintIndent();
-    this->stream << vid_global_barrier_expect_ << " += " << num_blocks << ";\n";
-    this->PrintIndent();
-    this->stream << "while (" << ptr << "[0] < " << vid_global_barrier_expect_
-                 << ");\n";
-    this->EndScope(wb);
-    this->PrintIndent();
-    this->stream << "}\n";
-    this->PrintIndent();
-    this->stream << "__syncthreads();\n";
+    LOG(FATAL) << "Global storage sync is no longer supported";
   }
 }
 
@@ -1845,9 +1806,9 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"float8_e4m3fnx4", "int32x2"},
         {"float8_e4m3fnuzx8", "int32x2"},
         {"float8_e4m3fnx8", "int32x2"},
-        {"float8_e5m2fnuzx4", "fp8_e5_4_t"},
+        {"float8_e5m2fnuzx4", "int32x2"},
         {"float8_e5m2fnuzx8", "int32x2"},
-        {"float8_e5m2x4", "fp8_e5_4_t"},
+        {"float8_e5m2x4", "int32x2"},
         {"float8_e5m2x8", "int32x2"},
         {"float32x16", "float32x16"},
         {"float32x32", "float32x32"}};
@@ -2157,10 +2118,6 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     MACAMath math_func;
     std::string func_name = math_func(op->dtype, "tan");
     os << func_name << "(" << PrintExpr(op->args[0]) << ")";
-  } else if (op->op.same_as(Op::Get("tir.rsqrt"))) {
-    MACAMath math_func;
-    std::string func_name = math_func(op->dtype, "rsqrt");
-    os << func_name << "(" << PrintExpr(op->args[0]) << ")";
   } else if (op->op.same_as(tl::__exp())) {
     MACAFastMath math_func;
     std::string func_name = math_func(op->dtype, "exp");
@@ -2391,11 +2348,11 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
 }
 
 void CodeGenTileLangMACA::VisitStmt_(const AttrStmtNode *op) {
-  if (op->attr_key == tir::attr::fragment_shape) {
+  if (op->attr_key == s_tir::attr::fragment_shape) {
     const VarNode *buffer = op->node.as<VarNode>();
     const StringImmNode *shape_str = op->value.as<StringImmNode>();
     fragment_shapes[buffer] = shape_str->value;
-  } else if (op->attr_key == tir::attr::fragment_layout) {
+  } else if (op->attr_key == s_tir::attr::fragment_layout) {
     const VarNode *buffer = op->node.as<VarNode>();
     const StringImmNode *layout_str = op->value.as<StringImmNode>();
     fragment_layouts[buffer] = layout_str->value;
@@ -2404,7 +2361,7 @@ void CodeGenTileLangMACA::VisitStmt_(const AttrStmtNode *op) {
     std::string func_name;
     int panel_size = 0;
     if (const auto *call = op->value.as<CallNode>()) {
-      if (call->op.same_as(tir::builtin::tvm_tuple()) &&
+      if (call->op.same_as(tirx::builtin::tvm_tuple()) &&
           call->args.size() >= 2) {
         const auto *name_node = call->args[0].as<StringImmNode>();
         const auto *size_node = call->args[1].as<IntImmNode>();
@@ -2440,26 +2397,29 @@ void CodeGenTileLangMACA::VisitStmt_(const AttrStmtNode *op) {
   CodeGenC::VisitStmt_(op);
 }
 
-void CodeGenTileLangMACA::VisitStmt_(const AllocateNode *op) {
-  ICHECK(!is_zero(op->condition));
-  std::string vid = AllocVarID(op->buffer_var.get());
+void CodeGenTileLangMACA::VisitStmt_(const AllocBufferNode *op) {
+  std::string vid = AllocVarID(op->buffer->data.get());
   this->PrintIndent();
-  std::string scope = GetPtrStorageScope(op->buffer_var);
-  const VarNode *buffer = op->buffer_var.as<VarNode>();
+  std::string scope = GetPtrStorageScope(op->buffer->data);
+  const VarNode *buffer = op->buffer->data.as<VarNode>();
+  DataType alloc_dtype = op->buffer->dtype;
   if (scope.find("wmma.") == 0) {
     if (scope == "wmma.matrix_a" || scope == "wmma.matrix_b") {
-      ICHECK(op->dtype == DataType::Float(16) ||
-             op->dtype == DataType::Int(8) || op->dtype == DataType::UInt(8) ||
-             op->dtype == DataType::Int(4) || op->dtype == DataType::UInt(4) ||
-             op->dtype == DataType::Int(1) || op->dtype == DataType::BFloat(16))
+      ICHECK(
+          alloc_dtype == DataType::Float(16) ||
+          alloc_dtype == DataType::Int(8) || alloc_dtype == DataType::UInt(8) ||
+          alloc_dtype == DataType::Int(4) || alloc_dtype == DataType::UInt(4) ||
+          alloc_dtype == DataType::Int(1) ||
+          alloc_dtype == DataType::BFloat(16))
           << "Matrix_a and matrix_b only support half or char or unsigned char "
           << "or uint4 or int4 or int1 type for now";
     } else {
-      ICHECK(op->dtype == DataType::Float(16) ||
-             op->dtype == DataType::Float(32) || op->dtype == DataType::Int(32))
+      ICHECK(alloc_dtype == DataType::Float(16) ||
+             alloc_dtype == DataType::Float(32) ||
+             alloc_dtype == DataType::Int(32))
           << "Accumulator only support half, float and int type for now";
     }
-    PrintWmmaScope(scope, op->dtype, buffer, stream);
+    PrintWmmaScope(scope, alloc_dtype, buffer, stream);
   } else if (scope == "local.descriptor.wgmma") {
     stream << "tl::GmmaDescriptor " << vid << ";\n";
   } else if (scope == "local.descriptor.tcgen05_smem") {
@@ -2471,23 +2431,25 @@ void CodeGenTileLangMACA::VisitStmt_(const AllocateNode *op) {
     stream << Downcast<StringImm>(op->annotations.at("barrier_type"))->value;
   } else {
     PrintStorageScope(scope, stream);
-    PrintType(op->dtype, stream);
+    PrintType(alloc_dtype, stream);
   }
 
   if (scope == "shared.dyn") {
     stream << ' ' << vid << "[];\n";
   } else {
-    size_t constant_size = op->ConstantAllocationSize();
-    ICHECK_GT(constant_size, 0)
+    auto alloc_ref = GetRef<AllocBuffer>(op);
+    auto opt_size = alloc_ref.ConstantAllocationSize();
+    ICHECK(opt_size.has_value())
         << "Can only handle constant size stack allocation for now, but get "
-        << constant_size << " for " << op->buffer_var->name_hint;
+        << " non-constant for " << op->buffer->data->name_hint;
+    size_t constant_size = static_cast<size_t>(opt_size.value());
     if (scope.find("wmma.") == 0) {
       constant_size = GetWmmaFragmentSize(scope, buffer, constant_size);
     }
-    if ((op->dtype == DataType::Int(4) || op->dtype == DataType::UInt(4) ||
-         op->dtype == DataType::Int(1)) &&
+    if ((alloc_dtype == DataType::Int(4) || alloc_dtype == DataType::UInt(4) ||
+         alloc_dtype == DataType::Int(1)) &&
         scope == "shared") {
-      constant_size = constant_size / (32 / op->dtype.bits());
+      constant_size = constant_size / (32 / alloc_dtype.bits());
     }
     if (scope == "shared") {
       stream << ' ' << vid << '[' << constant_size << "];\n";
@@ -2500,12 +2462,12 @@ void CodeGenTileLangMACA::VisitStmt_(const AllocateNode *op) {
     } else if (scope == "local") {
       stream << ' ' << vid << '[' << constant_size << "];\n";
     } else if (scope == "local.var") {
-      PrimExpr init = tir::make_const(op->dtype, 0);
+      PrimExpr init = tirx::make_const(alloc_dtype, 0);
       auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
       if (init_it != op->annotations.end()) {
         PrimExpr user_init = Downcast<PrimExpr>((*init_it).second);
-        if (!user_init.dtype().is_void() && user_init.dtype() != op->dtype) {
-          user_init = tir::Cast(op->dtype, user_init);
+        if (!user_init.dtype().is_void() && user_init.dtype() != alloc_dtype) {
+          user_init = tirx::Cast(alloc_dtype, user_init);
         }
         init = user_init;
       }
@@ -2517,24 +2479,13 @@ void CodeGenTileLangMACA::VisitStmt_(const AllocateNode *op) {
     }
   }
 
-  RegisterHandleType(op->buffer_var.get(), op->dtype);
-  this->PrintStmt(op->body);
+  RegisterHandleType(op->buffer->data.get(), alloc_dtype);
 }
 
 void CodeGenTileLangMACA::VisitStmt_(const EvaluateNode *op) {
   if (is_const_int(op->value))
     return;
   const CallNode *call = op->value.as<CallNode>();
-  if (call && call->op.same_as(builtin::tvm_global_barrier_kinit())) {
-    PrintIndent();
-    stream << "__shared__ unsigned " << vid_global_barrier_expect_ << ";\n";
-    PrintIndent();
-    stream << "if (threadIdx.x == 0) {\n";
-    PrintIndent();
-    stream << "  " << vid_global_barrier_expect_ << " = 0;\n";
-    PrintIndent();
-    stream << "}\n";
-  }
   if (call && (call->op.same_as(tvm::tl::device_assert()))) {
     std::string cond = PrintExpr(call->args[0]);
     this->PrintIndent();
@@ -2724,32 +2675,34 @@ void CodeGenTileLangMACA::VisitExpr_(const BroadcastNode *op,
                                      std::ostream &os) { // NOLINT(*)
   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
   if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8) {
-    if (lanes == 4) {
-      // make_int8x4
-      const int64_t *p = as_const_int(op->value);
-      ICHECK(p);
-      int64_t v = *p & 0xFF;
-      v = (v << 24) | (v << 16) | (v << 8) | v;
-      if (op->dtype.is_uint()) {
-        os << "(uint)" << v;
-      } else {
-        os << "(int)" << v;
+    const int64_t *p = as_const_int(op->value);
+    if (p) {
+      if (lanes == 4) {
+        // make_int8x4
+        ICHECK(p);
+        int64_t v = *p & 0xFF;
+        v = (v << 24) | (v << 16) | (v << 8) | v;
+        if (op->dtype.is_uint()) {
+          os << "(uint)" << v;
+        } else {
+          os << "(int)" << v;
+        }
+        return;
+      } else if (lanes == 32) {
+        // make_int8x32
+        const int64_t *p = as_const_int(op->value);
+        ICHECK(p);
+        int64_t v = *p & 0xFF;
+        v = (v << 24) | (v << 16) | (v << 8) | v;
+        if (op->dtype.is_uint()) {
+          os << "make_ulonglong4(" << v << ", " << v << ", " << v << ", " << v
+             << ")";
+        } else {
+          os << "make_longlong4(" << v << ", " << v << ", " << v << ", " << v
+             << ")";
+        }
+        return;
       }
-      return;
-    } else if (lanes == 32) {
-      // make_int8x32
-      const int64_t *p = as_const_int(op->value);
-      ICHECK(p);
-      int64_t v = *p & 0xFF;
-      v = (v << 24) | (v << 16) | (v << 8) | v;
-      if (op->dtype.is_uint()) {
-        os << "make_ulonglong4(" << v << ", " << v << ", " << v << ", " << v
-           << ")";
-      } else {
-        os << "make_longlong4(" << v << ", " << v << ", " << v << ", " << v
-           << ")";
-      }
-      return;
     }
   }
 
@@ -3108,15 +3061,15 @@ void CodeGenTileLangMACA::PrintFunctionSignature(const String &function_name,
   PrintFuncPrefix(os);
   CodeGenC::PrintType(func->ret_type, os);
   CodeGenC::PrintExtraAttrs(func, os);
-  bool no_alias = func->HasNonzeroAttr(tir::attr::kNoAlias);
+  bool no_alias = func->HasNonzeroAttr(tirx::attr::kNoAlias);
   // MXCC has issues with __restrict__ on kernel parameters when using PDL
   // (Programmatic Dependent Launch) synchronization. Suppress the annotation
   // when kHasGridSync is set.
   bool has_maca_pdl_sync = func->HasNonzeroAttr(tl::attr::kHasGridSync);
   std::unordered_set<const VarNode *> non_restrict;
   if (auto opt =
-          func->GetAttr<ffi::Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
-    for (const tir::Var &v : opt.value())
+          func->GetAttr<ffi::Array<tirx::Var>>(tl::attr::kNonRestrictParams)) {
+    for (const tirx::Var &v : opt.value())
       non_restrict.insert(v.get());
   }
   // Read-only param indices attribute, if present.
@@ -3129,7 +3082,7 @@ void CodeGenTileLangMACA::PrintFunctionSignature(const String &function_name,
   }
   os << " " << function_name << "(";
   for (size_t i = 0; i < func->params.size(); ++i) {
-    tir::Var v = func->params[i];
+    tirx::Var v = func->params[i];
     std::string vid = AllocVarID(v.get());
 
     if (i > 0) {
@@ -3197,15 +3150,15 @@ void CodeGenTileLangMACA::AddFunction(const GlobalVar &gvar,
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol)
       << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
-  bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
+  bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
   // MXCC has issues with __restrict__ on kernel parameters when using PDL
   // (Programmatic Dependent Launch) synchronization. Suppress the annotation
   // when kHasGridSync is set.
   bool has_maca_pdl_sync = f->HasNonzeroAttr(tl::attr::kHasGridSync);
   std::unordered_set<const VarNode *> non_restrict;
   if (auto opt =
-          f->GetAttr<ffi::Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
-    for (const tir::Var &v : opt.value())
+          f->GetAttr<ffi::Array<tirx::Var>>(tl::attr::kNonRestrictParams)) {
+    for (const tirx::Var &v : opt.value())
       non_restrict.insert(v.get());
   }
   // Read-only param indices attribute, if present.
@@ -3226,7 +3179,7 @@ void CodeGenTileLangMACA::AddFunction(const GlobalVar &gvar,
   this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
 
   for (size_t i = 0; i < f->params.size(); ++i) {
-    tir::Var v = f->params[i];
+    tirx::Var v = f->params[i];
     std::string vid = AllocVarID(v.get());
     if (i != 0)
       stream << ", ";

@@ -9,7 +9,7 @@
 #include "op/utils.h"
 #include "target/utils.h"
 
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/transform.h>
 
 #include <sstream>
 #include <utility>
@@ -18,7 +18,7 @@ namespace tvm {
 namespace tl {
 namespace maca {
 
-using namespace tir;
+using namespace tirx;
 
 namespace {
 

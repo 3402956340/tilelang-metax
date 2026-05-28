@@ -1,18 +1,18 @@
 #pragma once
 
-#include <tvm/tir/stmt.h>
+#include <tvm/tirx/stmt.h>
 
 namespace tvm {
 namespace tl {
 
 struct MACAMemcpyAsyncInjectResult {
-  tvm::tir::Stmt stmt;
+  tvm::tirx::Stmt stmt;
   bool injected_maca_memcpy_async{false};
 };
 
 /*! \brief Inject MACA memcpy_async lowering patterns into a statement.
  */
-MACAMemcpyAsyncInjectResult InjectMACAMemcpyAsync(const tvm::tir::Stmt &body,
+MACAMemcpyAsyncInjectResult InjectMACAMemcpyAsync(const tvm::tirx::Stmt &body,
                                                   const tvm::PrimExpr &mbar);
 
 } // namespace tl

@@ -223,8 +223,8 @@ def get_target_compute_version(target=None):
     # 1. input target object
     # 2. Target.current()
     target = target or tvm.target.Target.current()
-    if target and target.mcpu:
-        arch = target.mcpu[5:]
+    if target and "mcpu" in target.attrs:
+        arch = str(target.attrs["mcpu"])[5:]
         major = arch[:2]
         minor = arch[2:]
         if minor == "00":

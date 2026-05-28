@@ -4,12 +4,12 @@
  */
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/target/target.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/transform.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/expr.h>
+#include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -19,15 +19,13 @@
 
 #include "../op/builtin.h"
 #include "../op/utils.h"
-#include "../target/utils.h"
 #include "maca_memcpy_async_injector.h"
 #include "tir/ir/buffer_common.h"
-#include "tvm/tir/stmt.h"
 
 namespace tvm {
 namespace tl {
 
-using namespace tir;
+using namespace tirx;
 
 class MACAMemcpyAsyncInjector : public StmtMutator {
 public:
@@ -296,7 +294,7 @@ private:
         return PrimExpr();
       }
       if (const auto *rhs_broadcast = rhs.as<BroadcastNode>()) {
-        return tir::Add(lhs_ramp->base, rhs_broadcast->value);
+        return tirx::Add(lhs_ramp->base, rhs_broadcast->value);
       }
     }
     if (const auto *rhs_ramp = rhs.as<RampNode>()) {
@@ -304,7 +302,7 @@ private:
         return PrimExpr();
       }
       if (const auto *lhs_broadcast = lhs.as<BroadcastNode>()) {
-        return tir::Add(rhs_ramp->base, lhs_broadcast->value);
+        return tirx::Add(rhs_ramp->base, lhs_broadcast->value);
       }
     }
     return PrimExpr();
@@ -413,7 +411,7 @@ private:
   bool injected_maca_memcpy_async_{false};
 };
 
-using namespace tir::transform;
+using namespace tirx::transform;
 
 MACAMemcpyAsyncInjectResult InjectMACAMemcpyAsync(const Stmt &body,
                                                   const PrimExpr &mbar) {

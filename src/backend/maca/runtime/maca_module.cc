@@ -23,24 +23,22 @@
 #include "maca_module.h"
 
 #include <cstddef>
-#include <dmlc/memory_io.h>
-#include <future>
 #include <mcr/mc_runtime_api.h>
+#include <tvm/ffi/cast.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/module.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 
 #include <array>
 #include <mutex>
 #include <string>
-#include <unordered_map>
-#include <vector>
 
 #include "maca_common.h"
-#include "runtime/file_utils.h"
-#include "runtime/meta_data.h"
+#include "runtime/metadata.h"
 #include "runtime/pack_args.h"
 #include "runtime/thread_storage_scope.h"
+#include "support/bytes_io.h"
 
 namespace tvm {
 namespace runtime {
@@ -59,7 +57,7 @@ inline void EnsureCurrentDeviceContext(int device_id) {
 class MACAModuleNode : public ffi::ModuleObj {
 public:
   explicit MACAModuleNode(std::string data, std::string fmt,
-                          std::unordered_map<std::string, FunctionInfo> fmap,
+                          ffi::Map<ffi::String, FunctionInfo> fmap,
                           std::string maca_source)
       : data_(data), fmt_(fmt), fmap_(fmap), maca_source_(maca_source) {
     std::fill(module_.begin(), module_.end(), nullptr);
@@ -81,29 +79,13 @@ public:
   }
   ffi::Optional<ffi::Function> GetFunction(const ffi::String &name) final;
 
-  void WriteToFile(const ffi::String &file_name,
-                   const ffi::String &format) const final {
-    std::string fmt = GetFileFormat(file_name, format);
-    std::string meta_file = GetMetaFilePath(file_name);
-    if (fmt == "maca") {
-      ICHECK_NE(maca_source_.length(), 0);
-      SaveMetaDataToFile(meta_file, fmap_);
-      SaveBinaryToFile(file_name, maca_source_);
-    } else {
-      ICHECK_EQ(fmt, fmt_) << "Can only save to format=" << fmt_;
-      SaveMetaDataToFile(meta_file, fmap_);
-      SaveBinaryToFile(file_name, data_);
-    }
-  }
-
   ffi::Bytes SaveToBytes() const final {
     std::string buffer;
-    dmlc::MemoryStringStream ms(&buffer);
-    dmlc::Stream *stream = &ms;
-    stream->Write(fmt_);
-    stream->Write(fmap_);
-    stream->Write(data_);
-    return ffi::Bytes(buffer);
+    support::BytesOutStream stream(&buffer);
+    stream.Write(fmt_);
+    stream.Write(fmap_);
+    stream.Write(data_);
+    return ffi::Bytes(std::move(buffer));
   }
 
   ffi::String InspectSource(const ffi::String &format) const final {
@@ -130,8 +112,9 @@ public:
     mcError_t result =
         mcModuleGetFunction(&func, module_[device_id], func_name.c_str());
     if (result != mcSuccess) {
-      LOG(FATAL) << "MACAError: mcModuleGetFunction " << func_name
-                 << " failed with error: " << mcGetErrorString(result);
+      const char *msg = mcGetErrorName(result);
+      TVM_FFI_THROW(MACAError) << "mcModuleGetFunction " << func_name
+                               << " failed with error: " << msg;
     }
     return func;
   }
@@ -148,7 +131,7 @@ public:
 
     MACA_DRIVER_CALL(mcModuleGetGlobal(&global, &nbytes, module_[device_id],
                                        global_name.c_str()));
-    ICHECK_EQ(nbytes, expect_nbytes);
+    TVM_FFI_ICHECK_EQ(nbytes, expect_nbytes);
     return global;
   }
 
@@ -158,7 +141,7 @@ private:
   // The format
   std::string fmt_;
   // function information table.
-  std::unordered_map<std::string, FunctionInfo> fmap_;
+  ffi::Map<ffi::String, FunctionInfo> fmap_;
   // The maca source.
   std::string maca_source_;
   // the internal modules per GPU, to be lazily initialized.
@@ -171,9 +154,9 @@ private:
 class MACAWrappedFunc {
 public:
   // initialize the MACA function.
-  void Init(MACAModuleNode *m, ObjectPtr<Object> sptr,
+  void Init(MACAModuleNode *m, ffi::ObjectPtr<ffi::Object> sptr,
             const std::string &func_name, size_t num_void_args,
-            const std::vector<std::string> &launch_param_tags) {
+            const ffi::Array<ffi::String> &launch_param_tags) {
     m_ = m;
     sptr_ = sptr;
     func_name_ = func_name;
@@ -196,7 +179,8 @@ public:
         static_cast<mcStream_t>(TVMFFIEnvGetStream(kDLMACA, device_id));
     mcError_t result;
 
-    ICHECK(wl.grid_dim(0) > 0 && wl.grid_dim(1) > 0 && wl.grid_dim(2) > 0)
+    TVM_FFI_ICHECK(wl.grid_dim(0) > 0 && wl.grid_dim(1) > 0 &&
+                   wl.grid_dim(2) > 0)
         << "MACALaunch Error: grid dimension must be positive, but got"
         << " grid=(" << wl.grid_dim(0) << "," << wl.grid_dim(1) << ","
         << wl.grid_dim(2) << ")"
@@ -251,7 +235,7 @@ public:
            << "// -----------\n"
            << maca;
       }
-      LOG(FATAL) << os.str();
+      TVM_FFI_THROW(InternalError) << os.str();
     }
 
     // Check for asynchronous MACA errors that mcLaunchKernel's return value
@@ -266,8 +250,9 @@ public:
         const char *err_str = mcGetErrorString(last_err);
         // Clear the sticky error so subsequent MACA calls are not poisoned.
         mcGetLastError();
-        LOG(FATAL) << func_name_ << ": " << (err_name ? err_name : "unknown")
-                   << " - " << err_str;
+        TVM_FFI_THROW(InternalError)
+            << func_name_ << ": " << (err_name ? err_name : "unknown") << " - "
+            << err_str;
       }
     }
   }
@@ -276,7 +261,7 @@ private:
   // internal module
   MACAModuleNode *m_;
   // the resource holder
-  ObjectPtr<Object> sptr_;
+  ffi::ObjectPtr<ffi::Object> sptr_;
   // The name of the function.
   std::string func_name_;
   // Device function cache per device.
@@ -288,54 +273,41 @@ private:
 
 ffi::Optional<ffi::Function>
 MACAModuleNode::GetFunction(const ffi::String &name) {
-  ObjectPtr<Object> sptr_to_self = ffi::GetObjectPtr<Object>(this);
-  ICHECK_EQ(sptr_to_self.get(), this);
-  auto it = fmap_.find(name);
-  if (it == fmap_.end())
+  ffi::ObjectPtr<ffi::Object> sptr_to_self =
+      ffi::GetObjectPtr<ffi::Object>(this);
+  TVM_FFI_ICHECK_EQ(sptr_to_self.get(), this);
+  auto opt_info = fmap_.Get(name);
+  if (!opt_info.has_value())
     return ffi::Function();
-  const FunctionInfo &info = it->second;
+  FunctionInfo info = opt_info.value();
   MACAWrappedFunc f;
-  f.Init(this, sptr_to_self, name, info.arg_types.size(),
-         info.launch_param_tags);
-  return PackFuncPackedArgAligned(f, info.arg_types);
+  f.Init(this, sptr_to_self, name, info->arg_types.size(),
+         info->launch_param_tags);
+  return PackFuncPackedArgAligned(f, info->arg_types);
 }
 
 ffi::Module MACAModuleCreate(std::string data, std::string fmt,
-                             std::unordered_map<std::string, FunctionInfo> fmap,
+                             ffi::Map<ffi::String, FunctionInfo> fmap,
                              std::string maca_source) {
   auto n = ffi::make_object<MACAModuleNode>(data, fmt, fmap, maca_source);
   return ffi::Module(n);
 }
 
-ffi::Module MACAModuleLoadFile(const std::string &file_name,
-                               const ffi::String &format) {
-  std::string data;
-  std::unordered_map<std::string, FunctionInfo> fmap;
-  std::string fmt = GetFileFormat(file_name, format);
-  std::string meta_file = GetMetaFilePath(file_name);
-  LoadBinaryFromFile(file_name, &data);
-  LoadMetaDataFromFile(meta_file, &fmap);
-  return MACAModuleCreate(data, fmt, fmap, std::string());
-}
-
 ffi::Module MACAModuleLoadFromBytes(const ffi::Bytes &bytes) {
-  dmlc::MemoryFixedSizeStream ms(const_cast<char *>(bytes.data()),
-                                 bytes.size());
-  dmlc::Stream *stream = &ms;
+  support::BytesInStream stream(bytes);
   std::string data;
-  std::unordered_map<std::string, FunctionInfo> fmap;
+  ffi::Map<ffi::String, FunctionInfo> fmap;
   std::string fmt;
-  stream->Read(&fmt);
-  stream->Read(&fmap);
-  stream->Read(&data);
+  stream.Read(&fmt);
+  TVM_FFI_ICHECK(stream.Read(&fmap));
+  stream.Read(&data);
   return MACAModuleCreate(data, fmt, fmap, std::string());
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef()
-      .def("ffi.Module.load_from_file.maca", MACAModuleLoadFile)
-      .def("ffi.Module.load_from_bytes.maca", MACAModuleLoadFromBytes);
+  refl::GlobalDef().def("ffi.Module.load_from_bytes.maca",
+                        MACAModuleLoadFromBytes);
 }
 } // namespace runtime
 } // namespace tvm

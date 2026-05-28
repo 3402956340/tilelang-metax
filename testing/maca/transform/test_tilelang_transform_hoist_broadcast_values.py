@@ -35,7 +35,6 @@ def qwq(dtype=torch.float8_e4m3fn):
     return main
 
 
-@pytest.mark.xfail
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu, torch.float16])
 def test_hoist_broadcast(dtype):
     kernel = qwq(dtype)
@@ -55,11 +54,11 @@ auto_target = tvm.target.Target(determine_target("auto"))
 
 def _check(original, transformed):
     mod = tvm.IRModule.from_expr(original.with_attr("global_symbol", "main"))
-    mod = tvm.tir.transform.BindTarget(auto_target)(mod)
+    mod = tvm.tirx.transform.BindTarget(auto_target)(mod)
     mod = tl.transform.HoistBroadcastValues()(mod)
 
     transformed = tvm.IRModule.from_expr(transformed.with_attr("global_symbol", "main"))
-    transformed = tvm.tir.transform.BindTarget(auto_target)(transformed)
+    transformed = tvm.tirx.transform.BindTarget(auto_target)(transformed)
 
     tvm.ir.assert_structural_equal(mod["main"], transformed["main"], True)
 

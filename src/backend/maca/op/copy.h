@@ -8,7 +8,6 @@
 
 #include "op/copy.h"
 
-#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -16,7 +15,7 @@ namespace tvm {
 namespace tl {
 namespace maca {
 
-using namespace tir;
+using namespace tirx;
 
 enum class CopyInst : uint8_t {
   kNormal = 0,

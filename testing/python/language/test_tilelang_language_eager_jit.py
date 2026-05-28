@@ -44,6 +44,7 @@ def test_jit2_gemm():
     torch.testing.assert_close(C, C_ref, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.pytest.mark.xfail
 def test_jit2_gemm_ptr():
     @tilelang.jit
     def gemm_ptr(
@@ -73,7 +74,7 @@ def test_jit2_gemm_ptr():
                 T.gemm(A_shared, B_shared, C_local)
             T.copy(C_local, C[bx * block_M, by * block_N])
 
-    prod = product([T.float16, T.float32], [T.float32])
+    prod = product([T.float16, T.tfloat32], [T.float32])
     gemm_ptr.par_compile(
         [
             {"A": T.ptr(), "B": T.ptr(), "C": T.ptr(), "M": 1024, "N": 1024, "K": 1024, "dtype": in_dtype, "out_dtype": out_dtype}

@@ -16,7 +16,6 @@ set(TVM_INCLUDES
   ${TVM_SOURCE}/include
   ${TVM_SOURCE}/src
   ${TVM_SOURCE}/3rdparty/dlpack/include
-  ${TVM_SOURCE}/3rdparty/dmlc-core/include
 )
 
 if(EXISTS ${TVM_SOURCE}/ffi/include)
@@ -39,7 +38,7 @@ endif()
 set(ffi_core_pyi "${TVM_SOURCE}/3rdparty/tvm-ffi/python/tvm_ffi/core.pyi")
 file(READ "${ffi_core_pyi}" FILE_CONTENTS)
 if(NOT FILE_CONTENTS MATCHES ".*kDLMACA.*")
-  string(REPLACE "kDLTrn = 17" "kDLTrn = 17\n    kDLMACA = 19\n    kDLMACAHost = 20" NEW_CONTENTS "${FILE_CONTENTS}")
+  string(REPLACE "kDLTrn = 18" "kDLTrn = 18\n    kDLMACA = 19\n    kDLMACAHost = 20" NEW_CONTENTS "${FILE_CONTENTS}")
   file(WRITE "${ffi_core_pyi}" "${NEW_CONTENTS}")
 endif()
 set(ffi_container_tensor "${TVM_SOURCE}/3rdparty/tvm-ffi/include/tvm/ffi/container/tensor.h")
@@ -57,7 +56,7 @@ endif()
 set(ffi_cython_device_pxi "${TVM_SOURCE}/3rdparty/tvm-ffi/python/tvm_ffi/cython/device.pxi")
 file(READ "${ffi_cython_device_pxi}" FILE_CONTENTS)
 if(NOT FILE_CONTENTS MATCHES ".*kDLMACA.*")
-  string(REPLACE "kDLTrn = 17" "kDLTrn = 17\n    kDLMACA = 19\n    kDLMACAHost = 20" NEW_CONTENTS "${FILE_CONTENTS}")
+  string(REPLACE "kDLTrn = 18" "kDLTrn = 18\n    kDLMACA = 19\n    kDLMACAHost = 20" NEW_CONTENTS "${FILE_CONTENTS}")
   string(REPLACE "DLDeviceType.kDLTrn: \"trn\"," "DLDeviceType.kDLTrn: \"trn\",\n      DLDeviceType.kDLMACA: \"maca\",\n      DLDeviceType.kDLMACAHost: \"maca_host\"," NEW_CONTENTS "${NEW_CONTENTS}")
   string(REPLACE "\"trn\": DLDeviceType.kDLTrn," "\"trn\": DLDeviceType.kDLTrn,\n        \"maca\": DLDeviceType.kDLMACA," NEW_CONTENTS "${NEW_CONTENTS}")
   file(WRITE "${ffi_cython_device_pxi}" "${NEW_CONTENTS}")

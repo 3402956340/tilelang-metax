@@ -21,8 +21,9 @@
  * \file intrin_rule_maca.cc
  * \brief MACA intrinsic rules.
  */
-#include <tvm/tir/builtin.h>
-#include <tvm/tir/op_attr_types.h>
+#include "support/check.h"
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op_attr_types.h>
 
 #include "target/intrin_rule.h"
 
@@ -30,7 +31,7 @@ namespace tvm {
 namespace codegen {
 namespace intrin {
 // Add float suffix to the intrinsics, MACA fast math.
-using tir::FLowerIntrinsic;
+using tirx::FLowerIntrinsic;
 
 struct MACAMath {
   std::string operator()(DataType t, std::string name) const {
@@ -121,19 +122,19 @@ struct MACAPopcount {
 struct MACAWarpIntrinsic {
   const Op operator()(DataType t, const Op &orig_op) const {
     if (orig_op.same_as(builtin::tvm_warp_shuffle())) {
-      return Op::Get("tir.maca.__shfl_sync");
+      return Op::Get("tirx.maca.__shfl_sync");
     } else if (orig_op.same_as(builtin::tvm_warp_shuffle_up())) {
-      return Op::Get("tir.maca.__shfl_up_sync");
+      return Op::Get("tirx.maca.__shfl_up_sync");
     } else {
       ICHECK(orig_op.same_as(builtin::tvm_warp_shuffle_down()));
-      return Op::Get("tir.maca.__shfl_down_sync");
+      return Op::Get("tirx.maca.__shfl_down_sync");
     }
   }
 };
 
 static PrimExpr DispatchMACAWarpActiveMask(const PrimExpr &e) {
   const CallNode *call = e.as<CallNode>();
-  return Call(call->dtype, Op::Get("tir.maca.__activemask"), call->args);
+  return Call(call->dtype, Op::Get("tirx.maca.__activemask"), call->args);
 }
 
 template <typename T> static PrimExpr DispatchMACAShuffle(const PrimExpr &e) {
@@ -145,123 +146,131 @@ template <typename T> static PrimExpr DispatchMACAShuffle(const PrimExpr &e) {
   return Call(call->dtype, T()(call->dtype, Downcast<Op>(call->op)), maca_args);
 }
 
-TVM_REGISTER_OP("tir.clz").set_attr<FLowerIntrinsic>(
-    "maca.FLowerIntrinsic",
-    DispatchPureExtern<MACAMath, /*dtype_from_arg=*/true>);
+TVM_REGISTER_OP("tirx.clz")
+    .set_attr<FLowerIntrinsic>(
+        "maca.FLowerIntrinsic",
+        DispatchPureExtern<MACAMath, /*dtype_from_arg=*/true>);
 
-TVM_REGISTER_OP("tir.floor")
+TVM_REGISTER_OP("tirx.floor")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.ceil")
+TVM_REGISTER_OP("tirx.ceil")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.trunc")
+TVM_REGISTER_OP("tirx.trunc")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.fabs")
+TVM_REGISTER_OP("tirx.fabs")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.round")
+TVM_REGISTER_OP("tirx.round")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.nearbyint")
+TVM_REGISTER_OP("tirx.nearbyint")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.exp").set_attr<FLowerIntrinsic>(
-    "maca.FLowerIntrinsic", DispatchPureExtern<MACAMath>);
-
-TVM_REGISTER_OP("tir.exp2")
+TVM_REGISTER_OP("tirx.exp")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.exp10")
+TVM_REGISTER_OP("tirx.exp2")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.erf").set_attr<FLowerIntrinsic>(
-    "maca.FLowerIntrinsic", DispatchPureExtern<MACAMath>);
-
-TVM_REGISTER_OP("tir.log").set_attr<FLowerIntrinsic>(
-    "maca.FLowerIntrinsic", DispatchPureExtern<MACAMath>);
-
-TVM_REGISTER_OP("tir.log2")
+TVM_REGISTER_OP("tirx.exp10")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.log10")
+TVM_REGISTER_OP("tirx.erf")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.tan").set_attr<FLowerIntrinsic>(
-    "maca.FLowerIntrinsic", DispatchPureExtern<MACAMath>);
-
-TVM_REGISTER_OP("tir.cos").set_attr<FLowerIntrinsic>(
-    "maca.FLowerIntrinsic", DispatchPureExtern<MACAMath>);
-
-TVM_REGISTER_OP("tir.cosh")
+TVM_REGISTER_OP("tirx.log")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.sin").set_attr<FLowerIntrinsic>(
-    "maca.FLowerIntrinsic", DispatchPureExtern<MACAMath>);
-
-TVM_REGISTER_OP("tir.sinh")
+TVM_REGISTER_OP("tirx.log2")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.atan")
+TVM_REGISTER_OP("tirx.log10")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.tanh")
+TVM_REGISTER_OP("tirx.tan")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.sqrt")
+TVM_REGISTER_OP("tirx.cos")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.pow").set_attr<FLowerIntrinsic>(
-    "maca.FLowerIntrinsic", DispatchPureExtern<MACAMath>);
+TVM_REGISTER_OP("tirx.cosh")
+    .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
+                               DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.popcount")
+TVM_REGISTER_OP("tirx.sin")
+    .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
+                               DispatchPureExtern<MACAMath>);
+
+TVM_REGISTER_OP("tirx.sinh")
+    .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
+                               DispatchPureExtern<MACAMath>);
+
+TVM_REGISTER_OP("tirx.atan")
+    .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
+                               DispatchPureExtern<MACAMath>);
+
+TVM_REGISTER_OP("tirx.tanh")
+    .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
+                               DispatchPureExtern<MACAMath>);
+
+TVM_REGISTER_OP("tirx.sqrt")
+    .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
+                               DispatchPureExtern<MACAMath>);
+
+TVM_REGISTER_OP("tirx.pow")
+    .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
+                               DispatchPureExtern<MACAMath>);
+
+TVM_REGISTER_OP("tirx.popcount")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAPopcount>);
 
-TVM_REGISTER_OP("tir.tvm_warp_shuffle")
+TVM_REGISTER_OP("tirx.tvm_warp_shuffle")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchMACAShuffle<MACAWarpIntrinsic>);
 
-TVM_REGISTER_OP("tir.tvm_warp_shuffle_up")
+TVM_REGISTER_OP("tirx.tvm_warp_shuffle_up")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchMACAShuffle<MACAWarpIntrinsic>);
 
-TVM_REGISTER_OP("tir.tvm_warp_shuffle_down")
+TVM_REGISTER_OP("tirx.tvm_warp_shuffle_down")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchMACAShuffle<MACAWarpIntrinsic>);
 
-TVM_REGISTER_OP("tir.tvm_warp_activemask")
+TVM_REGISTER_OP("tirx.tvm_warp_activemask")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchMACAWarpActiveMask);
 
-TVM_REGISTER_OP("tir.fmod")
+TVM_REGISTER_OP("tirx.fmod")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
-TVM_REGISTER_OP("tir.rsqrt")
+TVM_REGISTER_OP("tirx.rsqrt")
     .set_attr<FLowerIntrinsic>("maca.FLowerIntrinsic",
                                DispatchPureExtern<MACAMath>);
 
 // Register low-level builtin ops.
 // TODO(tvm-team): consider make MACA its own subfolder and create a file for
 // low-level builtins.
-TVM_REGISTER_OP("tir.maca.__shfl_sync")
+TVM_REGISTER_OP("tirx.maca.__shfl_sync")
     .set_num_inputs(4)
     .add_argument("mask", "Expr", "The thread mask.")
     .add_argument("var", "Expr", "The variable to sync.")
@@ -273,7 +282,7 @@ TVM_REGISTER_OP("tir.maca.__shfl_sync")
                                Integer(CallEffectKind::kOpaque))
     .set_attr<bool>("maca.need_warp_shuffle", true);
 
-TVM_REGISTER_OP("tir.maca.__shfl_up_sync")
+TVM_REGISTER_OP("tirx.maca.__shfl_up_sync")
     .set_num_inputs(4)
     .add_argument("mask", "Expr", "The thread mask.")
     .add_argument("var", "Expr", "The variable to sync.")
@@ -285,7 +294,7 @@ TVM_REGISTER_OP("tir.maca.__shfl_up_sync")
                                Integer(CallEffectKind::kOpaque))
     .set_attr<bool>("maca.need_warp_shuffle", true);
 
-TVM_REGISTER_OP("tir.maca.__shfl_down_sync")
+TVM_REGISTER_OP("tirx.maca.__shfl_down_sync")
     .set_num_inputs(4)
     .add_argument("mask", "Expr", "The thread mask.")
     .add_argument("var", "Expr", "The variable to sync.")
@@ -298,7 +307,7 @@ TVM_REGISTER_OP("tir.maca.__shfl_down_sync")
                                Integer(CallEffectKind::kOpaque))
     .set_attr<bool>("maca.need_warp_shuffle", true);
 
-TVM_REGISTER_OP("tir.maca.__activemask")
+TVM_REGISTER_OP("tirx.maca.__activemask")
     .set_num_inputs(0)
     .set_attr<TGlobalSymbol>("TGlobalSymbol", "__activemask")
     .set_attr<TCallEffectKind>("TCallEffectKind",

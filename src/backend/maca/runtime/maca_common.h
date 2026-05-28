@@ -25,9 +25,7 @@
 #define TVM_RUNTIME_MACA_MACA_COMMON_H_
 
 #include <mcr/mc_runtime_api.h>
-#include <tvm/runtime/packed_func.h>
-
-#include <string>
+#include <tvm/ffi/function.h>
 
 #include "runtime/workspace_pool.h"
 
@@ -38,22 +36,20 @@ namespace runtime {
   {                                                                            \
     mcError_t result = x;                                                      \
     if (result != mcSuccess && result != mcErrorDeinitialized) {               \
-      LOG(FATAL) << "MACA MACA Error: " #x " failed with error: "              \
-                 << mcGetErrorString(result);                                  \
+      const char *msg = mcGetErrorName(result);                                \
+      TVM_FFI_THROW(MACAError) << "" #x " failed with error: " << msg;         \
     }                                                                          \
   }
 
 #define MACA_CALL(func)                                                        \
   {                                                                            \
     mcError_t e = (func);                                                      \
-    ICHECK(e == mcSuccess) << "MACA MACA: " << mcGetErrorString(e);            \
+    TVM_FFI_ICHECK(e == mcSuccess) << "MACA: " << mcGetErrorString(e);         \
   }
 
 /*! \brief Thread local workspace */
 class MACAThreadEntry {
 public:
-  /*! \brief The maca stream */
-  mcStream_t stream{nullptr};
   /*! \brief thread local pool*/
   WorkspacePool pool;
   /*! \brief constructor */
