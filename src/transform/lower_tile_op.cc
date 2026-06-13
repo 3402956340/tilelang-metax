@@ -4,6 +4,7 @@
  */
 
 #include "support/check.h"
+#include <optional>
 #include <tvm/ir/cast.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/s_tir/utils.h>
@@ -22,7 +23,7 @@
 #include "../op/gemm_sp.h"
 #include "../op/operator.h"
 #include "../op/utils.h"
-#include "../target/utils.h"
+#include "backend/common/target_utils.h"
 #include "ptx_async_copy_injector.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
@@ -742,8 +743,8 @@ private:
     }
     if (const auto *var_node = expr.as<VarNode>()) {
       Var var = GetRef<Var>(var_node);
-      auto it = let_bindings_.find(var);
-      if (it != let_bindings_.end()) {
+      auto it = bind_var_to_expr_.find(var);
+      if (it != bind_var_to_expr_.end()) {
         return it->second;
       }
     }
@@ -1059,7 +1060,7 @@ private:
     PrimExpr value = this->VisitExpr(op->value);
     bool recorded = false;
     if (value->IsInstance<BufferLoadNode>()) {
-      let_bindings_[op->var] = value;
+      bind_var_to_expr_[op->var] = value;
       recorded = true;
     }
     if (SideEffect(value) <= CallEffectKind::kPure) {
@@ -1155,15 +1156,17 @@ private:
 
     Range thread_bounds = CurrentThreadBounds();
 
-    // Convert let_bindings_ to Map<Var, PrimExpr> for LowerArgs
-    Map<Var, PrimExpr> let_var_to_expr;
-    for (const auto &[var, expr] : let_bindings_) {
-      let_var_to_expr.Set(var, expr);
+    // Convert bind_var_to_expr_ to Map<Var, PrimExpr> for LowerArgs
+    Map<Var, PrimExpr> bind_var_to_expr;
+    for (const auto &[var, expr] : bind_var_to_expr_) {
+      bind_var_to_expr.Set(var, expr);
     }
 
-    AllocMBarrierCallback mbarrier_callback = [this](int arrive_count) -> int {
+    AllocMBarrierCallback mbarrier_callback =
+        [this](int arrive_count, std::optional<std::string> name) -> int {
       if (!mbarrier_buffer_.defined()) {
-        mbarrier_buffer_ = CreateMBarrierBuffer(injected_mbarrier_name_, 1);
+        mbarrier_buffer_ =
+            CreateMBarrierBuffer(name.value_or(injected_mbarrier_name_), 1);
       }
       int id = mbarrier_count_++;
       mbarrier_arrive_counts_.push_back(arrive_count);
@@ -1178,7 +1181,7 @@ private:
     auto lowered = tile_op->Lower(
         LowerArgs{target_, thread_bounds, thread_var_->var, callback,
                   mbarrier_callback, barrier_arrive_callback, layout_map_,
-                  buffer_remap_, let_var_to_expr,
+                  buffer_remap_, bind_var_to_expr,
                   loop_mbar_phase_stack_.empty()
                       ? PrimExpr(IntImm(DataType::Int(32), 0))
                       : loop_mbar_phase_stack_.back(),
@@ -1286,6 +1289,23 @@ private:
       predicate = Downcast<PrimExpr>(
           op->annotations.Get(attr::kParallelLoopPredicate).value());
     }
+    bool require_padding_guard = false;
+    if (auto padding_guard_anno =
+            op->annotations.Get(attr::kParallelLoopRequiresPaddingGuard)) {
+      if (auto padding_guard_bool =
+              padding_guard_anno.value().try_cast<Bool>()) {
+        require_padding_guard = padding_guard_bool.value()->value;
+      } else if (auto padding_guard_int =
+                     padding_guard_anno.value().as<IntImmNode>()) {
+        require_padding_guard = padding_guard_int->value != 0;
+      } else {
+        LOG(WARNING) << "Loop annotation `"
+                     << attr::kParallelLoopRequiresPaddingGuard
+                     << "` expects Bool value (True/False), but got "
+                     << padding_guard_anno.value().GetTypeKey()
+                     << ". Ignore override.";
+      }
+    }
     bool parallel_prefer_async = false;
     if (auto prefer_async_anno = op->annotations.Get(attr::kLoopPreferAsync)) {
       if (auto prefer_async_bool = prefer_async_anno.value().try_cast<Bool>()) {
@@ -1315,8 +1335,9 @@ private:
 
     auto root = GetRef<For>(op);
 
-    // Check if the loop writes to any non-local buffer.
-    // Thread partitioning is unnecessary when all stores target local buffers.
+    // Check if the loop writes to any non-local buffer or touches a fragment.
+    // Thread partitioning is unnecessary when all stores target local buffers
+    // and there are no fragment accesses.
     // For example:
     //   for i in T.Parallel(1024):
     //     A_local[i] = A_global[i]
@@ -1331,8 +1352,16 @@ private:
     // Element-level intrinsics (e.g. atomic_add) pass non-local buffer
     // pointers via tvm_access_ptr / tl::access_ptr inside CallNodes.
     bool has_non_local_store = false;
+    bool has_fragment_access = false;
     PostOrderVisit(root, [&](const ObjectRef &obj) {
-      if (const auto *store = obj.as<BufferStoreNode>()) {
+      if (const auto *load = obj.as<BufferLoadNode>()) {
+        if (IsFragmentBuffer(load->buffer)) {
+          has_fragment_access = true;
+        }
+      } else if (const auto *store = obj.as<BufferStoreNode>()) {
+        if (IsFragmentBuffer(store->buffer)) {
+          has_fragment_access = true;
+        }
         if (!IsLocalBuffer(store->buffer)) {
           has_non_local_store = true;
         }
@@ -1343,13 +1372,21 @@ private:
           if (buffer_var) {
             Var var = GetRef<Var>(buffer_var);
             auto it = buffer_map_.find(var);
-            if (it != buffer_map_.end() && !IsLocalBuffer(it->second)) {
-              has_non_local_store = true;
+            if (it != buffer_map_.end()) {
+              if (IsFragmentBuffer(it->second)) {
+                has_fragment_access = true;
+              }
+              if (!IsLocalBuffer(it->second)) {
+                has_non_local_store = true;
+              }
             }
           }
         } else if (call->op.same_as(tl::access_ptr())) {
           // tl::access_ptr format: (BufferLoad, extent, rw_mask)
           if (const auto *load = call->args[0].as<BufferLoadNode>()) {
+            if (IsFragmentBuffer(load->buffer)) {
+              has_fragment_access = true;
+            }
             if (!IsLocalBuffer(load->buffer)) {
               has_non_local_store = true;
             }
@@ -1358,6 +1395,9 @@ private:
           // call_extern may pass address_of(non-local-buffer) pointers, and
           // PostOrderVisit reaches the address_of call directly.
           if (const auto *load = call->args[0].as<BufferLoadNode>()) {
+            if (IsFragmentBuffer(load->buffer)) {
+              has_fragment_access = true;
+            }
             if (!IsLocalBuffer(load->buffer)) {
               has_non_local_store = true;
             }
@@ -1366,10 +1406,11 @@ private:
       }
     });
 
-    // Determine if this is a true parallel loop requiring thread
-    // partitioning: parallel_loop = True if we need to partition the loop.
-    // Skip partitioning for loops that only have local stores.
-    bool parallel_loop = has_non_local_store;
+    // Determine if this loop requires thread partitioning. Fragment accesses
+    // must be partitioned together with their layout rewrite: once a logical
+    // fragment index is lowered to a physical per-thread slot, the logical loop
+    // iteration has to be owned by the corresponding thread.
+    bool parallel_loop = has_non_local_store || has_fragment_access;
 
     // Check if there are non-local buffer accesses (for vectorization decision)
     bool has_non_local = false;
@@ -1433,9 +1474,9 @@ private:
     bool should_vectorize =
         (has_non_local || has_cast_operations) && !has_reducer;
     // Lower the parallel loop using the common function
-    Stmt lowered = LowerParallelLoop(for_node, loop_layout, thread_var_->var,
-                                     analyzer_, layout_map_, predicate,
-                                     parallel_loop, should_vectorize);
+    Stmt lowered = LowerParallelLoop(
+        for_node, loop_layout, thread_var_->var, analyzer_, layout_map_,
+        predicate, parallel_loop, should_vectorize, require_padding_guard);
 
     // Only parallel-loop lowering needs PTX cp.async injection. Thread-level
     // lowering does not require converting eligible global->shared copies to
@@ -1486,7 +1527,7 @@ private:
   // By access CallNode instead of BufferLoad Node.
   bool is_ptx_{false};
   std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual>
-      let_bindings_;
+      bind_var_to_expr_;
   // Mapping from data Var of a Buffer to Buffer, for lookup
   std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> buffer_map_;
   Map<Var, Var> var_remap_;

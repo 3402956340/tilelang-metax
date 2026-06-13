@@ -2,15 +2,15 @@ import tilelang as tl
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
-from tilelang.engine.phase import LowerAndLegalize
+from tilelang.maca.pipeline import MACAPassPipelineBodyPrologue
 
 
 def _apply_plan_update(func: tvm.tirx.PrimFunc) -> tvm.IRModule:
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target("maca")
     mod = tvm.IRModule.from_expr(func.with_attr("global_symbol", "main"))
     with target:
-        mod = LowerAndLegalize(mod, target)
-        mod = tl.transform.LowerSharedTmem()(mod)
+        mod = MACAPassPipelineBodyPrologue(mod, target)
+        mod = tl.cuda.transform.LowerSharedTmem()(mod)
         mod = tl.transform.IfStmtBinding()(mod)
         mod = tl.transform.PlanAndUpdateBufferAllocationLocation()(mod)
     return mod
@@ -40,7 +40,6 @@ def _find_first_for(stmt: tvm.tirx.Stmt) -> tvm.tirx.For:
     return loops[0]
 
 
-@tilelang.testing.requires_cuda
 def test_plan_update_keeps_loop_header_local_var_outside_loop_body():
     @T.prim_func
     def func(x: T.Tensor((256,), "int64")):

@@ -10,6 +10,9 @@
 // Dependencies for operators
 #include "support/check.h"
 #include <array>
+#include <functional>
+#include <optional>
+#include <string>
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/op.h>
 #include <tvm/target/target.h>
@@ -29,7 +32,11 @@ using namespace tirx;
 using namespace ffi;
 
 using AddWorkspaceCallback = std::function<PrimExpr(int, DataType)>;
-using AllocMBarrierCallback = std::function<int(int arrive_count)>;
+// Allocate a compiler-generated shared mbarrier slot. The optional hint names
+// the backing barrier buffer when the first slot is created; later slots share
+// the same buffer and may ignore the hint.
+using AllocMBarrierCallback =
+    std::function<int(int arrive_count, std::optional<std::string> name)>;
 using UpdateBarrierArriveCallback = std::function<void(Var, PrimExpr)>;
 using LayoutMap = Map<Buffer, Layout>;
 using BufferMap = Map<Var, Buffer>;
@@ -93,9 +100,9 @@ struct LowerArgs {
   UpdateBarrierArriveCallback UpdateBarrierArrive;
   LayoutMap layout_map;
   Map<Buffer, Buffer> buffer_remap;
-  // Map from LetStmt variable to its bound expression, for resolving
-  // fragment buffer accesses through let bindings
-  Map<Var, PrimExpr> let_var_to_expr;
+  // Map from Bind variable to its bound expression, for resolving
+  // fragment buffer accesses through Bind values
+  Map<Var, PrimExpr> bind_var_to_expr;
   // Fallback mbarrier parity for ops that do not carry an explicit
   // tl.pipeline_mbar_phase_expr annotation. LowerTileOp derives this from the
   // nearest enclosing serial loop so non-pipelined TMA loops still alternate
@@ -118,9 +125,9 @@ struct LayoutInferArgs {
   arith::Analyzer *analyzer;
   bool buffer_oob = false;
   Map<Buffer, Buffer> buffer_remap;
-  // Map from LetStmt variable to its bound expression, for resolving
-  // fragment buffer accesses through let bindings
-  Map<Var, PrimExpr> let_var_to_expr;
+  // Map from Bind variable to its bound expression, for resolving
+  // fragment buffer accesses through Bind values
+  Map<Var, PrimExpr> bind_var_to_expr;
   // Whether the current TileOp is nested inside a pipelined loop
   // (i.e. a surrounding loop annotated with num_stages > 0).
   bool in_pipeline = false;

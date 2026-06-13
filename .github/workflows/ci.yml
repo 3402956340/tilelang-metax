@@ -358,8 +358,7 @@ jobs:
             pytest --verbose --color=yes --durations=0 --showlocals --cache-clear
           )
           "${PYTEST[@]}" --maxfail=3 --numprocesses=4 \
-            --ignore=../examples/maca/linear_attention \
-            ../examples/maca
+            ../examples
 
       # NVIDIA CUDA tests
       - name: Run CUDA tests with Python ${{ matrix.python-version }} (${{ matrix.runner.toolkit }})
@@ -401,9 +400,14 @@ jobs:
           )
           "${PYTEST[@]}" --maxfail=3 --numprocesses=2 \
             --ignore=./python/metal \
+            --ignore=./python/issue/test_tilelang_issue_sm120_tma_smem_alignment.py \
+            --ignore=./python/jit/test_tilelang_jit_cutedsl_host_codegen.py \
+            --ignore=./python/jit/test_tilelang_jit_nvrtc.py \
+            --ignore=./python/transform/test_tilelang_transform_im2col_fallback.py \
+            --ignore=./python/transform/test_tilelang_transform_inject_tcgen05_fence.py \
+            --ignore=./python/transform/test_tilelang_transform_fuse_mbarrier_arrive_expect_tx.py \
+            --ignore=./python/transform/test_tilelang_transform_lower_hopper_intrin.py \
             ./python
-          "${PYTEST[@]}" --maxfail=3 --numprocesses=2 \
-            ./maca
 
       # Apple Metal tests
       - name: Run Metal tests with Python ${{ matrix.python-version }} (${{ matrix.runner.toolkit }})

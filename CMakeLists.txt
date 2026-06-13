@@ -63,7 +63,7 @@ if(MSVC)
   #     flags injected by CMake/TVM (e.g. /FS, /Zc:preprocessor, /MP).
   #   * -fdelayed-template-parsing: TVM headers declare std::vector<T>
   #     members where T is only forward-declared at that point (e.g.
-  #     std::vector<tvm::tir::Stmt> in src/transform/arg_binder.h). cl.exe
+  #     std::vector<tvm::tir::Stmt> in src/transform/tvm_ffi_binder.h). cl.exe
   #     defers template parsing by default so the late stmt.h include in
   #     the .cc file resolves T before instantiation; modern clang parses
   #     templates eagerly and emits "incomplete type" errors. Re-enabling
@@ -360,7 +360,7 @@ set(HIDE_PRIVATE_SYMBOLS OFF CACHE BOOL "Compile TVM with -fvisibility=hidden." 
 # Include directories for TileLang
 set(TILE_LANG_INCLUDES ${TVM_INCLUDES})
 # Add TileLang's own src/ to include path so cross-directory includes
-# can use paths relative to src/ (e.g. "target/utils.h", "op/builtin.h").
+# can use paths relative to src/ (e.g. "backend/common/target_utils.h", "op/builtin.h").
 list(INSERT TILE_LANG_INCLUDES 0 "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # Collect source files
@@ -369,19 +369,21 @@ file(GLOB TILE_LANG_SRCS
   src/layout/*.cc
   src/transform/*.cc
   src/transform/common/*.cc
+  src/transform/pipeline/*.cc
   src/op/*.cc
-  src/backend/cpu/op/*.cc
-  src/backend/cuda/op/copy_analysis.cc
-  src/backend/metal/op/*.cc
-  src/backend/webgpu/op/*.cc
-  src/target/utils.cc
-  src/target/codegen_c_host.cc
-  src/target/codegen_c.cc
-  src/target/rt_mod_c.cc
+  src/cpu/op/*.cc
+  src/cuda/op/copy_analysis.cc
+  src/metal/op/*.cc
+  src/webgpu/op/*.cc
+  src/backend/common/target_utils.cc
+  src/backend/common/codegen/codegen_utils.cc
+  src/backend/common/codegen/codegen_c_host.cc
+  src/backend/common/codegen/codegen_c.cc
+  src/backend/common/codegen/rt_mod_c.cc
   # intrin_rule doesn't have system dependency; always compiled regardless of backend
-  src/backend/cuda/codegen/intrin_rule_cuda.cc
-  src/backend/rocm/codegen/intrin_rule_hip.cc
-  src/backend/maca/codegen/intrin_rule_maca.cc
+  src/cuda/codegen/intrin_rule_cuda.cc
+  src/rocm/codegen/intrin_rule_hip.cc
+  src/maca/codegen/intrin_rule_maca.cc
 )
 
 # Always include CPU-safe runtime helpers
@@ -393,7 +395,7 @@ list(APPEND TILE_LANG_SRCS
 # source on any platform.  Always compile it so that "target.build.tilelang_metal"
 # is available for cross-compilation on Linux/Windows.
 list(APPEND TILE_LANG_SRCS
-  src/target/codegen_metal.cc
+  src/backend/common/codegen/codegen_metal.cc
 )
 # Track if the user explicitly selected a backend via cache options.
 set(TILELANG_BACKEND_USER_SELECTED OFF)
@@ -462,10 +464,10 @@ endif()
 
 # Backend-local CMake files own native source lists, stubs, include paths, and
 # compile definitions. Top-level CMake only selects and delegates.
-include("${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cuda/CMakeLists.txt")
-include("${CMAKE_CURRENT_SOURCE_DIR}/src/backend/rocm/CMakeLists.txt")
-include("${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal/CMakeLists.txt")
-include("${CMAKE_CURRENT_SOURCE_DIR}/src/backend/maca/CMakeLists.txt")
+include("${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/CMakeLists.txt")
+include("${CMAKE_CURRENT_SOURCE_DIR}/src/rocm/CMakeLists.txt")
+include("${CMAKE_CURRENT_SOURCE_DIR}/src/metal/CMakeLists.txt")
+include("${CMAKE_CURRENT_SOURCE_DIR}/src/maca/CMakeLists.txt")
 
 set(USE_Z3      ON CACHE STRING "Use Z3 SMT solver for TileLang optimizations")
 set(USE_PYPI_Z3 ON CACHE BOOL   "Use Z3 provided by PyPI z3-solver package")

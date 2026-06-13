@@ -5,8 +5,11 @@ import random
 import torch
 import numpy as np
 from tilelang.contrib import nvcc
-from tilelang.utils.target import determine_target, target_is_cdna, target_is_cuda, target_is_gfx950
-from tvm.testing.utils import requires_cuda, requires_package, requires_llvm, requires_metal, requires_rocm, _compose
+from tilelang.backend.target import determine_target
+from tilelang.cuda.target import target_is_cuda
+from tilelang.rocm.target import target_is_cdna, target_is_gfx950
+from tilelang.maca.target import target_is_maca
+from tvm.testing.utils import requires_package, requires_llvm, requires_metal, requires_rocm, _compose
 
 from tilelang.utils.tensor import torch_assert_close as torch_assert_close
 from .perf_regression import process_func, regression
@@ -49,6 +52,36 @@ def _check_is_cuda_or_cdna() -> bool:
         return target_is_cuda(target) or target_is_cdna(target)
     except (ValueError, RuntimeError):
         return False
+
+
+def _check_is_maca() -> bool:
+    try:
+        target = determine_target("auto", return_object=True)
+        return target_is_maca(target)
+    except (ValueError, RuntimeError):
+        return False
+
+
+def requires_cuda(func):
+    is_maca = _check_is_maca()
+    marks = [
+        pytest.mark.skipif(
+            not is_maca,
+            reason="Requires CUDA like target",
+        ),
+    ]
+    return _compose([func], marks)
+
+
+def skip_on_maca(func):
+    is_maca = _check_is_maca()
+    marks = [
+        pytest.mark.skipif(
+            is_maca,
+            reason="Skip on MACA target",
+        ),
+    ]
+    return _compose([func], marks)
 
 
 def requires_cdna(func):
@@ -130,10 +163,14 @@ def requires_cuda_compute_version(major_version, minor_version=0, mode="ge"):
         - "le": less than or equal to
         - "lt": less than
     """
+    is_maca = _check_is_maca()
     min_version = (major_version, minor_version)
     try:
-        arch = nvcc.get_target_compute_version()
-        compute_version = nvcc.parse_compute_version(arch)
+        if is_maca:
+            compute_version = torch.cuda.get_device_capability()
+        else:
+            arch = nvcc.get_target_compute_version()
+            compute_version = nvcc.parse_compute_version(arch)
     except ValueError:
         # No GPU present.  This test will be skipped from the
         # requires_cuda() marks as well.
@@ -161,7 +198,10 @@ def requires_cuda_compute_version(major_version, minor_version=0, mode="ge"):
             not compare(compute_version, min_version, mode),
             reason=f"Requires CUDA compute {mode} {min_version_str}, but have {compute_version_str}",
         ),
-        *requires_cuda.marks(),
+        pytest.mark.skipif(
+            not is_maca,
+            reason="Requires CUDA like target",
+        ),
     ]
 
     def inner(func):

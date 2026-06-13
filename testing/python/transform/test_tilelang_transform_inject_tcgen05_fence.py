@@ -2,9 +2,8 @@
 from tilelang import tvm as tvm
 import tilelang as tl
 import tilelang.language as T
-from tilelang.engine.phase import LowerAndLegalize
+from tilelang.cuda.pipeline import CUDAPassPipelineBodyPrologue
 from tvm import tirx
-import tilelang.testing
 
 
 sm100_target = tvm.target.Target({"kind": "cuda", "arch": "sm_100"})
@@ -14,7 +13,7 @@ sm90_target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
 def _apply(func, target=sm100_target):
     mod = tvm.IRModule.from_expr(func.with_attr("global_symbol", "main"))
     mod = tvm.tirx.transform.BindTarget(target)(mod)
-    mod = tl.transform.InjectTcgen05Fence()(mod)
+    mod = tl.cuda.transform.InjectTcgen05Fence()(mod)
     mod = tl.transform.LowerOpaqueBlock()(mod)
     return mod
 
@@ -94,7 +93,6 @@ def test_storage_sync_is_wrapped_with_tcgen05_fences():
     _check(before, after)
 
 
-@tilelang.testing.requires_cuda
 def test_lower_tmem_copy_uses_tcgen05_ld_intrin():
     @T.prim_func
     def func(X: T.Tensor((256, 256), T.float16), Y: T.Tensor((256, 256), T.float16)):
@@ -120,15 +118,14 @@ def test_lower_tmem_copy_uses_tcgen05_ld_intrin():
 
     mod = tvm.IRModule.from_expr(func.with_attr("global_symbol", "main"))
     with sm100_target:
-        mod = LowerAndLegalize(mod, sm100_target)
-        mod = tl.transform.LowerSharedTmem()(mod)
+        mod = CUDAPassPipelineBodyPrologue(mod, sm100_target)
+        mod = tl.cuda.transform.LowerSharedTmem()(mod)
 
     body = mod["main"].body
     assert _count_calls(body, "tl.tcgen05_ld") == 1
     assert _count_extern_calls_with_prefix(body, "tl::tcgen05_ld_") == 0
 
 
-@tilelang.testing.requires_cuda
 def test_lower_tmem_copy_uses_tcgen05_st_intrin():
     @T.prim_func
     def func(X: T.Tensor((256, 256), T.bfloat16)):
@@ -169,8 +166,8 @@ def test_lower_tmem_copy_uses_tcgen05_st_intrin():
 
     mod = tvm.IRModule.from_expr(func.with_attr("global_symbol", "main"))
     with sm100_target:
-        mod = LowerAndLegalize(mod, sm100_target)
-        mod = tl.transform.LowerSharedTmem()(mod)
+        mod = CUDAPassPipelineBodyPrologue(mod, sm100_target)
+        mod = tl.cuda.transform.LowerSharedTmem()(mod)
 
     body = mod["main"].body
     assert _count_calls(body, "tl.tcgen05_st") == 1

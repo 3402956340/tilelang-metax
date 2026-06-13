@@ -11,7 +11,7 @@ from typing import Optional
 def get_bwd_configs():
     sm_major, sm_minor = torch.cuda.get_device_capability()
     sm_version = sm_major * 10 + sm_minor
-    if sm_version == 80:
+    if sm_version >= 80 and sm_version < 90:
         return 64, 32, 1, 128
     elif sm_version >= 90:
         return 128, 32, 2, 256
@@ -252,8 +252,6 @@ def flashattn_bwd(
             dv = T.alloc_fragment([block_M, dim], accum_dtype)
             dk = T.alloc_fragment([block_M, dim], accum_dtype)
             dq = T.alloc_fragment([block_N, dim], accum_dtype)
-            dv_shared = T.alloc_shared([block_M, dim], dtype)
-            dk_shared = T.alloc_shared([block_M, dim], dtype)
 
             T.annotate_layout(
                 {
@@ -302,10 +300,8 @@ def flashattn_bwd(
                 T.gemm(dsT_shared, K_shared, dq, transpose_A=True)
                 T.atomic_add(dQ[bz, bx, k * block_N : (k + 1) * block_N, :], dq)
 
-            T.copy(dv, dv_shared)
-            T.copy(dk, dk_shared)
-            T.copy(dv_shared, dV[bz, bx, by * block_M : (by + 1) * block_M, :])
-            T.copy(dk_shared, dK[bz, bx, by * block_M : (by + 1) * block_M, :])
+            T.copy(dv, dV[bz, bx, by * block_M : (by + 1) * block_M, :])
+            T.copy(dk, dK[bz, bx, by * block_M : (by + 1) * block_M, :])
 
     return flash_bwd
 

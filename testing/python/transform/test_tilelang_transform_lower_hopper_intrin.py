@@ -1,7 +1,7 @@
 from tilelang import tvm as tvm
 import tilelang as tl
 from tilelang.cuda import transform as cuda_transform
-from tilelang.utils.target import determine_target
+from tilelang.backend.target import determine_target
 import tilelang.language as T
 import tilelang.testing
 
@@ -39,7 +39,7 @@ def test_lower_shared_barrier():
 
     mod = tvm.IRModule.from_expr(before.with_attr("global_symbol", "main"))
     mod = tvm.tirx.transform.BindTarget(auto_target)(mod)
-    mod = tl.transform.LowerSharedBarrier()(mod)
+    mod = cuda_transform.LowerSharedBarrier()(mod)
     mod = tl.transform.LowerOpaqueBlock()(mod)
 
     main_func = mod["main"]

@@ -38,14 +38,15 @@ _P = ParamSpec("_P")
 _KP = ParamSpec("_KP")
 _T = TypeVar("_T")
 _Ret = TypeVar("_Ret")
+TargetLike = str | Target
 
 
 def compile(
     func: PrimFunc[_KP, _T] = None,
     out_idx: list[int] | int | None = None,
     execution_backend: Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
-    target: str | Target | None = None,
-    target_host: str | Target | None = None,
+    target: TargetLike | None = None,
+    target_host: TargetLike | None = None,
     verbose: bool | None = None,
     pass_configs: dict[str, Any] | None = None,
     compile_flags: list[str] | str | None = None,
@@ -62,10 +63,10 @@ def compile(
     execution_backend : Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
         Execution backend to use for kernel execution. If None, reads from
         TILELANG_EXECUTION_BACKEND environment variable (defaults to "auto").
-    target : Union[str, Target], optional
-        Compilation target, either as a string or a TVM Target object. If None, reads from
-        TILELANG_TARGET environment variable (defaults to "auto").
-    target_host : Union[str, Target], optional
+    target : str or tvm.target.Target, optional
+        Compilation target. If None, reads from TILELANG_TARGET environment
+        variable (defaults to "auto").
+    target_host : str or tvm.target.Target, optional
         Target host for cross-compilation (default: None).
     verbose : bool, optional
         Whether to enable verbose output. If None, reads from
@@ -124,8 +125,8 @@ def par_compile(
     funcs: Iterable[PrimFunc[_KP, _T]],
     out_idx: list[int] | int | None = None,
     execution_backend: Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
-    target: str | Target | None = None,
-    target_host: str | Target | None = None,
+    target: TargetLike | None = None,
+    target_host: TargetLike | None = None,
     verbose: bool | None = None,
     pass_configs: dict[str, Any] | None = None,
     compile_flags: list[str] | str | None = None,
@@ -144,10 +145,10 @@ def par_compile(
     execution_backend : Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
         Execution backend to use for kernel execution. If None, reads from
         TILELANG_EXECUTION_BACKEND environment variable (defaults to "auto").
-    target : Union[str, Target], optional
-        Compilation target, either as a string or a TVM Target object. If None, reads from
-        TILELANG_TARGET environment variable (defaults to "auto").
-    target_host : Union[str, Target], optional
+    target : str or tvm.target.Target, optional
+        Compilation target. If None, reads from TILELANG_TARGET environment
+        variable (defaults to "auto").
+    target_host : str or tvm.target.Target, optional
         Target host for cross-compilation (default: None).
     verbose : bool, optional
         Whether to enable verbose output. If None, reads from
@@ -254,9 +255,9 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         Index(es) of output tensor(s) to return (lazy mode only).
     execution_backend : str | None
         Backend for kernel execution ("auto", "dlpack", "tvm_ffi", etc.).
-    target : str | Target | None
+    target : str | tvm.target.Target | None
         TVM compilation target (e.g., "cuda", "llvm", "auto").
-    target_host : str | Target | None
+    target_host : str | tvm.target.Target | None
         Host target for cross-compilation.
     verbose : bool | None
         Enable verbose compilation output.
@@ -278,8 +279,8 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
 
     out_idx: list[int] | int | None
     execution_backend: Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None
-    target: str | Target | None
-    target_host: str | Target | None
+    target: TargetLike | None
+    target_host: TargetLike | None
     verbose: bool | None
     pass_configs: dict[str, Any] | None
     debug_root_path: str | None
@@ -427,6 +428,20 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         key = (key_args_tuple, key_kwargs_tuple, tuned_key_kwargs_tuple)
         return key
 
+    def _frontend_cache_key_data(self, key: tuple) -> dict[str, Any]:
+        func_name = getattr(getattr(self.func, "orig_func", self.func), "__name__", "jit_kernel")
+        func_qualname = getattr(getattr(self.func, "orig_func", self.func), "__qualname__", func_name)
+        func_module = getattr(getattr(self.func, "orig_func", self.func), "__module__", None)
+        return {
+            "function": func_name,
+            "qualname": func_qualname,
+            "module": func_module,
+            "source": self.func_source,
+            "signature": str(self.signature),
+            "key": repr(key),
+            "mode": self.mode,
+        }
+
     def get_kernel_source(self, *args: _P.args, **kwargs: _P.kwargs) -> str:
         kernel = self.compile(*args, **kwargs)
         return kernel.get_kernel_source()
@@ -458,7 +473,42 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         key, kernel_args = self.func.parse_args(*args, **kwargs)
         kernel = self._kernel_cache.get(key, None)
         if kernel is None:
-            kernel = self.compile(*args, **kwargs)
+            frontend_key_data = None
+            # Frontend cache is only safe when lazy-mode parse_args leaves no
+            # runtime kernel_args; then _frontend_cache_key_data fully identifies
+            # the compiled kernel, assuming compile-time values have stable reprs.
+            if self.mode == "lazy" and not kernel_args:
+                frontend_key_data = self._frontend_cache_key_data(key)
+                from tilelang.cache import load_frontend_cached
+
+                kernel = load_frontend_cached(
+                    frontend_key_data,
+                    out_idx=self.out_idx,
+                    execution_backend=self.execution_backend,
+                    target=self.target,
+                    target_host=self.target_host,
+                    verbose=self.verbose,
+                    pass_configs=self.pass_configs,
+                    compile_flags=self.compile_flags,
+                )
+            if kernel is None:
+                kernel = self.compile(*args, **kwargs)
+                if frontend_key_data is not None:
+                    kernel_key = getattr(kernel, "_tilelang_cache_key", None)
+                    if kernel_key:
+                        from tilelang.cache import store_frontend_cache
+
+                        store_frontend_cache(
+                            frontend_key_data,
+                            kernel_key,
+                            out_idx=self.out_idx,
+                            execution_backend=self.execution_backend,
+                            target=self.target,
+                            target_host=self.target_host,
+                            verbose=self.verbose,
+                            pass_configs=self.pass_configs,
+                            compile_flags=self.compile_flags,
+                        )
             self._kernel_cache[key] = kernel
 
         # eager mode: execute kernel immediately and return result
@@ -480,8 +530,8 @@ def jit(func: Callable[_KP, _T]) -> JITImpl[_KP, _KP, _T, _T]: ...
 def jit(
     *,
     out_idx: Any = None,
-    target: str | Target | None = None,
-    target_host: str | Target | None = None,
+    target: TargetLike | None = None,
+    target_host: TargetLike | None = None,
     execution_backend: ExecutionBackend | None = None,
     verbose: bool | None = None,
     pass_configs: dict[str, Any] | None = None,
@@ -494,8 +544,8 @@ def jit(
     func: Callable[_P, _T] | PrimFunc | None = None,
     *,  # Indicates subsequent arguments are keyword-only
     out_idx: list[int] | int | None = None,
-    target: str | Target | None = None,
-    target_host: str | Target | None = None,
+    target: TargetLike | None = None,
+    target_host: TargetLike | None = None,
     execution_backend: ExecutionBackend | None = None,
     verbose: bool | None = None,
     pass_configs: dict[str, Any] | None = None,
@@ -513,9 +563,9 @@ def jit(
     ----------
     out_idx : list[int] | int | None
         Output tensor index(es). Only supported in lazy mode.
-    target : str | Target | None
-        TVM compilation target (e.g., "cuda", "llvm", "auto").
-    target_host : str | Target | None
+    target : str | tvm.target.Target | None
+        Compilation target (e.g., "cuda", "llvm", "auto").
+    target_host : str | tvm.target.Target | None
         Host target for cross-compilation.
     execution_backend : ExecutionBackend | None
         Backend for kernel execution.
