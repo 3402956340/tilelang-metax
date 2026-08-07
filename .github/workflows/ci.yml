@@ -7,6 +7,7 @@ on:
       - opened
       - synchronize
       - reopened
+      - ready_for_review
   # Allow to trigger the workflow manually
   workflow_dispatch:
 
@@ -39,7 +40,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           submodules: recursive
@@ -60,6 +61,12 @@ jobs:
         run: |
           "${{ steps.setup-pylowest.outputs.python-path }}" -m compileall -q -f tilelang
 
+      - name: C++ API Style Audit (warning only)
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          "${{ steps.setup-pylowest.outputs.python-path }}" maint/scripts/audit_cpp_api_style.py --github-warnings --limit 20
+
       - name: Pre-commit Lint
         run: |
           if ! pipx run pre-commit run --all-files --color=always --show-diff-on-failure; then
@@ -77,11 +84,6 @@ jobs:
     strategy:
       matrix:
         runner:
-          # - tags: [self-hosted, nvidia]
-          #   name: self-hosted-nvidia
-          #   # Format: [Nightly-]CUDA-<major>.<minor>[.<patch>]. E.g., "CUDA-12.8" or "Nightly-CUDA-13.0".
-          #   # Use "Nightly-" prefix to use torch nightly builds.
-          #   toolkit: CUDA-12.8
           # ROCm CI is temporarily disabled.
           # - tags: [self-hosted, amd, gpu]
           #   name: self-hosted-amd
@@ -91,7 +93,7 @@ jobs:
           - tags: tilelang-metax-runner
             name: self-hosted-metax
             # Format: MACA-<major>.<minor>[.<patch>]. E.g., "MACA-3.0".
-            toolkit: MACA-3.7
+            toolkit: MACA-3.8
           - tags: [macos-latest]
             name: macos-latest
             toolkit: Metal # or Nightly-Metal
@@ -101,15 +103,8 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Install dependencies for runner (MetaX)
-        if: contains(matrix.runner.toolkit, 'MACA')
-        run: |
-          sudo apt-get update && sudo apt-get install -y git ccache
-          export PATH="/opt/conda/bin:${PATH}"
-          echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
-
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           submodules: recursive
@@ -134,8 +129,8 @@ jobs:
           echo "UV_CACHE_DIR=${XDG_CACHE_HOME}/uv" | tee -a "${GITHUB_ENV}"
           echo "PRE_COMMIT_HOME=${XDG_CACHE_HOME}/pip/.pre-commit" | tee -a "${GITHUB_ENV}"
 
-      # Do not use ccache on self-hosted runners, as it will download/upload caches which is slow.
-      # Self-hosted runners usually have more CPU power to compile without ccache.
+      # Use the ccache action only on GitHub-hosted runners, where it manages
+      # remote cache restore/save. Self-hosted runners use a local cache below.
       - name: Setup ccache (GitHub-hosted runners)
         id: setup-ccache
         if: ${{ !startsWith(matrix.runner.name, 'self-hosted') }}
@@ -150,14 +145,72 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-${{ matrix.runner.toolkit }}
             ${{ runner.os }}-${{ runner.arch }}
 
+      - name: Setup ccache (self-hosted runners)
+        if: startsWith(matrix.runner.name, 'self-hosted')
+        run: |
+          if ! command -v ccache >/dev/null 2>&1; then
+            echo "::warning::ccache is not installed on this self-hosted runner; CMake will build without ccache."
+            exit 0
+          fi
+
+          export CCACHE_DIR="${XDG_CACHE_HOME}/ccache/${{ matrix.runner.name }}/${{ matrix.runner.toolkit }}"
+          mkdir -p "${CCACHE_DIR}"
+
+          echo "CCACHE_DIR=${CCACHE_DIR}" | tee -a "${GITHUB_ENV}"
+          echo "CCACHE_BASEDIR=${{ github.workspace }}" | tee -a "${GITHUB_ENV}"
+          echo "CCACHE_NOHASHDIR=true" | tee -a "${GITHUB_ENV}"
+          echo "CCACHE_COMPILERCHECK=content" | tee -a "${GITHUB_ENV}"
+
+          ccache -M 20G
+          ccache -z
+          ccache -s
+
       - name: Set environment (CUDA)
         if: contains(matrix.runner.toolkit, 'CUDA')
         run: |
-          TOOLKIT="${{ matrix.runner.toolkit }}"
-          CUDA_VERSION="${TOOLKIT##*-}"
+          RAW_TOOLKIT="${{ matrix.runner.toolkit }}"
+          TOOLKIT="${RAW_TOOLKIT#Nightly-}"
+          USE_TORCH_NIGHTLY=0
+          if [[ "${RAW_TOOLKIT}" == "Nightly-"* ]]; then
+            USE_TORCH_NIGHTLY=1
+          fi
+
+          if [[ ! -x "$(command -v nvcc)" ]]; then
+            export PATH="/usr/local/cuda/bin:${PATH}"
+            export LD_LIBRARY_PATH="/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+            echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" | tee -a "${GITHUB_ENV}"
+          fi
+
+          NVCC_VERSION=""
+          if [[ -x "$(command -v nvcc)" ]]; then
+            echo "\$ $(command -v nvcc) --version" && nvcc --version
+            NVCC_VERSION="$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1)"
+          fi
+
+          if [[ "${TOOLKIT}" == "CUDA-auto" ]]; then
+            if [[ -z "${NVCC_VERSION}" ]]; then
+              echo "::error::CUDA-auto requires nvcc in PATH, but nvcc was not found or its version could not be parsed."
+              exit 1
+            fi
+            case "${NVCC_VERSION%%.*}" in
+              13) CUDA_VERSION="13.0" ;;
+              *)
+                echo "::error::CUDA-auto requires a CUDA 13 runner, but nvcc reported ${NVCC_VERSION}."
+                exit 1
+                ;;
+            esac
+          else
+            CUDA_VERSION="${TOOLKIT##*-}"
+            if [[ -n "${NVCC_VERSION}" && "${NVCC_VERSION%%.*}" != "${CUDA_VERSION%%.*}" ]]; then
+              echo "::error::nvcc CUDA ${NVCC_VERSION} does not match requested ${TOOLKIT}."
+              exit 1
+            fi
+          fi
+
           CUDA_VERSION_MAJMIN="$(echo ${CUDA_VERSION} | cut -d '.' -f-2)"
           CUDA_VERSION_MAJMIN_NODOT="${CUDA_VERSION_MAJMIN//./}"
-          if [[ "${TOOLKIT}" == "Nightly-"* ]]; then
+          if [[ "${USE_TORCH_NIGHTLY}" == "1" ]]; then
             # Use torch nightly builds
             export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/nightly/cu${CUDA_VERSION_MAJMIN_NODOT}"
           else
@@ -169,20 +222,9 @@ jobs:
           echo "CUDA_VERSION=${CUDA_VERSION}" | tee -a "${GITHUB_ENV}"
           echo "CUDA_VERSION_MAJMIN=${CUDA_VERSION_MAJMIN}" | tee -a "${GITHUB_ENV}"
           echo "CUDA_VERSION_MAJMIN_NODOT=${CUDA_VERSION_MAJMIN_NODOT}" | tee -a "${GITHUB_ENV}"
+          echo "CUDA_NVCC_VERSION=${NVCC_VERSION:-unknown}" | tee -a "${GITHUB_ENV}"
           echo "PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}" | tee -a "${GITHUB_ENV}"
           echo "UV_INDEX=${UV_INDEX}" | tee -a "${GITHUB_ENV}"
-
-          if [[ ! -x "$(command -v nvcc)" ]]; then
-            export PATH="/usr/local/cuda/bin:${PATH}"
-            export LD_LIBRARY_PATH="/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-            echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
-            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" | tee -a "${GITHUB_ENV}"
-          fi
-          if [[ -x "$(command -v nvcc)" ]]; then
-            echo "\$ $(command -v nvcc) --version" && nvcc --version
-          else
-            echo "::warning::nvcc not found in PATH!"
-          fi
 
       - name: Set environment (ROCm)
         if: contains(matrix.runner.toolkit, 'ROCm')
@@ -225,7 +267,6 @@ jobs:
           export UV_INDEX="http://mirrors.aliyun.com/pypi/simple"
           export CLANG_TIDY_CMAKE_OPTIONS="${CLANG_TIDY_CMAKE_OPTIONS} -DUSE_MACA=ON"
 
-          echo "USE_MACA=ON" | tee -a "${GITHUB_ENV}"
           echo "UV_INDEX=${UV_INDEX}" | tee -a "${GITHUB_ENV}"
           echo "CLANG_TIDY_CMAKE_OPTIONS=${CLANG_TIDY_CMAKE_OPTIONS}" | tee -a "${GITHUB_ENV}"
 
@@ -288,7 +329,6 @@ jobs:
             uv pip install -v -r requirements-test-rocm.txt
           elif [[ "${{ matrix.runner.toolkit }}" == *"MACA"* ]]; then
             uv pip install -r requirements-test-maca.txt
-            uv pip install --no-deps --python-version 3.10.0 flash_linear_attention==0.4.0 -i https://repos.metax-tech.com/r/maca-pypi/simple --trusted-host repos.metax-tech.com
           elif [[ "${{ matrix.runner.toolkit }}" == *"Metal"* ]]; then
             uv pip install -v -r requirements-test-metal.txt
           else
@@ -331,6 +371,13 @@ jobs:
           uv pip install -v .
           uv pip install -v 3rdparty/tvm/3rdparty/tvm-ffi
 
+      - name: Show ccache stats
+        if: always()
+        run: |
+          if command -v ccache >/dev/null 2>&1; then
+            ccache -s || true
+          fi
+
       - name: Clean up stale /tmp files (self-hosted runners)
         if: startsWith(matrix.runner.name, 'self-hosted')
         run: |
@@ -357,7 +404,7 @@ jobs:
             uv run --no-project -m --
             pytest --verbose --color=yes --durations=0 --showlocals --cache-clear
           )
-          "${PYTEST[@]}" --maxfail=3 \
+          "${PYTEST[@]}" --maxfail=3 --numprocesses=4 \
             ../examples
 
       # NVIDIA CUDA tests
@@ -433,7 +480,7 @@ jobs:
           fi
 
   cutedsl:
-    name: CuTeDSL Examples for Python 3.12 with CUDA-12.8 (on self-hosted-nvidia)
+    name: CuTeDSL Examples for Python 3.12 with CUDA-auto (on self-hosted-nvidia)
     if: |
       github.repository_owner == 'tile-ai' &&
       false &&
@@ -444,7 +491,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           submodules: recursive
@@ -468,10 +515,51 @@ jobs:
           echo "UV_CACHE_DIR=${XDG_CACHE_HOME}/uv" | tee -a "${GITHUB_ENV}"
           echo "PRE_COMMIT_HOME=${XDG_CACHE_HOME}/pip/.pre-commit" | tee -a "${GITHUB_ENV}"
 
+      - name: Setup ccache (self-hosted runners)
+        run: |
+          if ! command -v ccache >/dev/null 2>&1; then
+            echo "::warning::ccache is not installed on this self-hosted runner; CMake will build without ccache."
+            exit 0
+          fi
+
+          export CCACHE_DIR="${XDG_CACHE_HOME}/ccache/self-hosted-nvidia/CUDA-auto"
+          mkdir -p "${CCACHE_DIR}"
+
+          echo "CCACHE_DIR=${CCACHE_DIR}" | tee -a "${GITHUB_ENV}"
+          echo "CCACHE_BASEDIR=${{ github.workspace }}" | tee -a "${GITHUB_ENV}"
+          echo "CCACHE_NOHASHDIR=true" | tee -a "${GITHUB_ENV}"
+          echo "CCACHE_COMPILERCHECK=content" | tee -a "${GITHUB_ENV}"
+
+          ccache -M 20G
+          ccache -z
+          ccache -s
+
       - name: Set environment (CUDA)
         run: |
-          TOOLKIT="CUDA-12.8"
-          CUDA_VERSION="${TOOLKIT##*-}"
+          TOOLKIT="CUDA-auto"
+
+          if [[ ! -x "$(command -v nvcc)" ]]; then
+            export PATH="/usr/local/cuda/bin:${PATH}"
+            export LD_LIBRARY_PATH="/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+            echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" | tee -a "${GITHUB_ENV}"
+          fi
+
+          if [[ ! -x "$(command -v nvcc)" ]]; then
+            echo "::error::CUDA-auto requires nvcc in PATH."
+            exit 1
+          fi
+          echo "\$ $(command -v nvcc) --version" && nvcc --version
+          NVCC_VERSION="$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1)"
+
+          case "${NVCC_VERSION%%.*}" in
+            13) CUDA_VERSION="13.0" ;;
+            *)
+              echo "::error::CUDA-auto requires a CUDA 13 runner, but nvcc reported ${NVCC_VERSION}."
+              exit 1
+              ;;
+          esac
+
           CUDA_VERSION_MAJMIN="$(echo ${CUDA_VERSION} | cut -d '.' -f-2)"
           CUDA_VERSION_MAJMIN_NODOT="${CUDA_VERSION_MAJMIN//./}"
           export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUDA_VERSION_MAJMIN_NODOT}"
@@ -481,20 +569,9 @@ jobs:
           echo "CUDA_VERSION=${CUDA_VERSION}" | tee -a "${GITHUB_ENV}"
           echo "CUDA_VERSION_MAJMIN=${CUDA_VERSION_MAJMIN}" | tee -a "${GITHUB_ENV}"
           echo "CUDA_VERSION_MAJMIN_NODOT=${CUDA_VERSION_MAJMIN_NODOT}" | tee -a "${GITHUB_ENV}"
+          echo "CUDA_NVCC_VERSION=${NVCC_VERSION}" | tee -a "${GITHUB_ENV}"
           echo "PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}" | tee -a "${GITHUB_ENV}"
           echo "UV_INDEX=${UV_INDEX}" | tee -a "${GITHUB_ENV}"
-
-          if [[ ! -x "$(command -v nvcc)" ]]; then
-            export PATH="/usr/local/cuda/bin:${PATH}"
-            export LD_LIBRARY_PATH="/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-            echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
-            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" | tee -a "${GITHUB_ENV}"
-          fi
-          if [[ -x "$(command -v nvcc)" ]]; then
-            echo "\$ $(command -v nvcc) --version" && nvcc --version
-          else
-            echo "::warning::nvcc not found in PATH!"
-          fi
 
       - name: Setup Python and uv with caching
         id: setup-uv
@@ -506,7 +583,7 @@ jobs:
           prune-cache: false
           cache-local-path: ${{ env.UV_CACHE_DIR }}
           ignore-nothing-to-cache: true
-          cache-suffix: uv-${{ runner.os }}-${{ runner.arch }}-3.12-self-hosted-nvidia-CUDA-12.8
+          cache-suffix: uv-${{ runner.os }}-${{ runner.arch }}-3.12-self-hosted-nvidia-CUDA-auto
           cache-dependency-glob: |
             pyproject.toml
             requirements*.txt
@@ -540,12 +617,19 @@ jobs:
         run: |
           uv pip install -v .
 
+      - name: Show ccache stats
+        if: always()
+        run: |
+          if command -v ccache >/dev/null 2>&1; then
+            ccache -s || true
+          fi
+
       - name: Clean up stale /tmp files (self-hosted runners)
         run: |
           rm -f /tmp/tmp*.so /tmp/tmp*.cu /tmp/tmp*.cubin /tmp/tmp*.cpp
           rm -rf /tmp/tvm-debug-mode-tempdirs /tmp/tilelang_cutedsl_*
 
-      - name: Run CuTeDSL examples with Python 3.12 (CUDA-12.8)
+      - name: Run CuTeDSL examples with Python 3.12 (CUDA-auto)
         env:
           TILELANG_TARGET: cutedsl
         run: |

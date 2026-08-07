@@ -77,7 +77,7 @@ private:
 
   static CopyInst SelectInst(const CopyNode &op, Target target,
                              const LayoutMap &layout_map,
-                             arith::Analyzer *analyzer, bool buffer_oob);
+                             arith::Analyzer *analyzer);
 
   static void CheckParallelLoopLayout(const CopyNode &op, CopyInst copy_inst);
 
@@ -128,15 +128,16 @@ void Copy::CollectFragmentLayouts(const PrimExpr &expr,
   });
 }
 
-LayoutMap Copy::InferLayout(const CopyNode &op, const LayoutInferArgs &T,
+LayoutMap Copy::InferLayout(const CopyNode &op,
+                            const LayoutInferArgs &layout_args,
                             InferLevel level) {
-  CopyInst copy_inst =
-      SelectInst(op, T.target, T.layout_map, T.analyzer, T.buffer_oob);
+  CopyInst copy_inst = SelectInst(op, layout_args.target,
+                                  layout_args.layout_map, layout_args.analyzer);
   CheckParallelLoopLayout(op, copy_inst);
 
   // For normal/cp.async, layout inference follows the generated
   // SIMT loop. MACA-specific explicit layout cases are handled above.
-  return op.InferSIMTLayout(T, level);
+  return op.InferSIMTLayout(layout_args, level);
 }
 
 void Copy::CheckParallelLoopLayout(const CopyNode &op, CopyInst copy_inst) {
@@ -157,34 +158,33 @@ void Copy::CheckParallelLoopLayout(const CopyNode &op, CopyInst copy_inst) {
 
 CopyInst Copy::SelectInst(const CopyNode &op, Target target,
                           const LayoutMap &layout_map,
-                          arith::Analyzer *analyzer, bool buffer_oob) {
+                          arith::Analyzer *analyzer) {
   CopyAnalysisContext ctx;
   ctx.target = target;
   ctx.layout_map = &layout_map;
   ctx.analyzer = analyzer;
-  ctx.buffer_oob = buffer_oob;
   ctx.emit_diagnostics = true;
   auto result = SelectCopyInstForLowering(op, ctx);
   ICHECK(result.supported) << result.reason;
   return result.inst;
 }
 
-Stmt Copy::Lower(const CopyNode &op, const LowerArgs &T,
+Stmt Copy::Lower(const CopyNode &op, const LowerArgs &lower_args,
                  arith::Analyzer *analyzer) {
   auto copy_inst =
-      SelectInst(op, T.target, T.layout_map, analyzer, /*buffer_oob=*/false);
+      SelectInst(op, lower_args.target, lower_args.layout_map, analyzer);
   if (copy_inst == CopyInst::kMemcpyAsync) {
-    auto memcpy_async = LowerMemcpyAsync(op, T, analyzer);
+    auto memcpy_async = LowerMemcpyAsync(op, lower_args, analyzer);
     ICHECK(memcpy_async.defined()) << "Failed to lower memcpy_async copy";
     return memcpy_async;
   } else if (copy_inst == CopyInst::kNormal) {
-    return LowerNormal(op, T, analyzer);
+    return LowerNormal(op, lower_args, analyzer);
   } else {
     LOG(FATAL) << "Unsupported copy inst " << static_cast<int>(copy_inst);
   }
 }
 
-Stmt Copy::LowerMemcpyAsync(const CopyNode &op, const LowerArgs &T,
+Stmt Copy::LowerMemcpyAsync(const CopyNode &op, const LowerArgs &lower_args,
                             arith::Analyzer *analyzer) {
   using namespace tvm::transform;
 
@@ -192,7 +192,7 @@ Stmt Copy::LowerMemcpyAsync(const CopyNode &op, const LowerArgs &T,
   bool enable_async_copy =
       pass_ctx->GetConfig<Bool>(kEnableAsyncCopy, Bool(true)).value();
   if (!enable_async_copy) {
-    return LowerNormal(op, T, analyzer);
+    return LowerNormal(op, lower_args, analyzer);
   }
 
   PrimExpr mbar_handle;
@@ -210,19 +210,20 @@ Stmt Copy::LowerMemcpyAsync(const CopyNode &op, const LowerArgs &T,
   std::vector<InferLevel> levels = {InferLevel::kCommon, InferLevel::kStrict,
                                     InferLevel::kFree};
   for (auto level : levels) {
-    par_op->InferLayout({T.target,
-                         T.thread_bounds,
-                         T.layout_map,
+    par_op->InferLayout({lower_args.target,
+                         lower_args.thread_bounds,
+                         lower_args.layout_map,
                          analyzer,
-                         false,
-                         T.buffer_remap,
+                         lower_args.buffer_remap,
                          {}},
                         level);
   }
   auto loop_layout = par_op->GetLoopLayout();
-  Stmt lowered_loop =
-      LowerParallelLoop(par_op->GetRoot(), loop_layout, T.thread_var, analyzer,
-                        T.layout_map, par_op->GetPredicate(T.thread_var));
+  Stmt lowered_loop = LowerParallelLoop(
+      par_op->GetRoot(), loop_layout, lower_args.thread_index, analyzer,
+      lower_args.layout_map, par_op->GetPredicate(lower_args.thread_index),
+      /*parallel_loop=*/true, /*should_vectorize=*/true,
+      par_op->LoopLayoutRequiresPaddingGuard());
 
   auto inject_result = InjectMACAMemcpyAsync(lowered_loop, mbar_handle);
   Stmt memcpy_async_loop = inject_result.stmt;
@@ -234,7 +235,7 @@ Stmt Copy::LowerMemcpyAsync(const CopyNode &op, const LowerArgs &T,
                   << ")";
     DLOG(WARNING) << "Fallback to normal copy because cp.async rewrite found "
                      "no eligible global->shared store.";
-    return LowerNormal(op, T, analyzer);
+    return LowerNormal(op, lower_args, analyzer);
   }
   return memcpy_async_loop;
 }

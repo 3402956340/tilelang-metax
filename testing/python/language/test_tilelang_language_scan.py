@@ -148,7 +148,6 @@ def run_cumsum_1d(N, block_N, reverse=False, dtype=T.float32, scope="smem"):
     torch.testing.assert_close(tilelang_res, ref_res, atol=1e-3, rtol=1e-3)
 
 
-@tilelang.testing.pytest.mark.xfail
 def test_cumsum_smem():
     # Test different sizes
     run_cumsum(256, 256, 64, 64)
@@ -393,13 +392,16 @@ def run_cummax(M, N, block_M, block_N, dim=0, reverse=False, dtype=T.float32, sc
     torch.testing.assert_close(tilelang_res, ref_res, atol=1e-3, rtol=1e-3)
 
 
-def cummax_smem_test_1d(N, block_N, reverse=False, dtype=T.float32):
+def cummax_smem_test_1d(N, block_N, reverse=False, dtype=T.float32, threads=None):
+    if threads is None:
+        threads = block_N
+
     @T.prim_func
     def cummax(
         A: T.Tensor((N,), dtype),
         B: T.Tensor((N,), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), threads=block_N) as bx:
+        with T.Kernel(T.ceildiv(N, block_N), threads=threads) as bx:
             A_shared = T.alloc_shared((block_N,), dtype)
 
             T.copy(A[bx * block_N], A_shared)
@@ -427,16 +429,20 @@ def cummax_fragment_test_1d(N, block_N, reverse=False, dtype=T.float32):
     return cummax
 
 
-def run_cummax_1d(N, block_N, reverse=False, dtype=T.float32, scope="smem"):
+def run_cummax_1d(N, block_N, reverse=False, dtype=T.float32, scope="smem", negative_input=False, threads=None):
     if scope == "smem":
-        program = cummax_smem_test_1d(N, block_N, reverse, dtype)
+        program = cummax_smem_test_1d(N, block_N, reverse, dtype, threads)
     elif scope == "fragment":
         program = cummax_fragment_test_1d(N, block_N, reverse, dtype)
     else:
         raise ValueError(f"Unknown scope {scope}")
 
     jit_kernel = tl.compile(program, out_idx=-1)
-    A = torch.randn(N, dtype=getattr(torch, dtype)).cuda()
+    torch_dtype = getattr(torch, dtype)
+    if negative_input:
+        A = -torch.arange(1, N + 1, dtype=torch.float32, device="cuda").to(torch_dtype)
+    else:
+        A = torch.randn(N, dtype=torch_dtype).cuda()
 
     def ref_program(A):
         ref_b = torch.empty_like(A)
@@ -452,7 +458,6 @@ def run_cummax_1d(N, block_N, reverse=False, dtype=T.float32, scope="smem"):
     torch.testing.assert_close(tilelang_res, ref_res, atol=1e-3, rtol=1e-3)
 
 
-@tilelang.testing.pytest.mark.xfail
 def test_cummax_smem():
     run_cummax(256, 256, 64, 64)
     run_cummax(256, 256, 64, 64, dim=1)
@@ -461,28 +466,83 @@ def test_cummax_smem():
     run_cummax(192, 160, 64, 32, dim=0, reverse=True)
 
 
-@tilelang.testing.pytest.mark.xfail
 def test_cummax_fragment():
     run_cummax(256, 256, 64, 64, scope="fragment")
     run_cummax(256, 256, 64, 64, dim=1, scope="fragment")
     run_cummax(256, 256, 64, 64, dim=1, reverse=True, scope="fragment")
 
 
-@tilelang.testing.pytest.mark.xfail
 def test_cummax_out_of_place():
     run_cummax(128, 128, 64, 64, dim=1, scope="smem_out")
 
 
-@tilelang.testing.pytest.mark.xfail
 def test_cummax_smem_1d():
     run_cummax_1d(512, 64)
     run_cummax_1d(512, 64, reverse=True)
+    run_cummax_1d(80, 40, reverse=True, negative_input=True, threads=64)
 
 
-@tilelang.testing.pytest.mark.xfail
 def test_cummax_fragment_1d():
     run_cummax_1d(512, 64, scope="fragment")
     run_cummax_1d(512, 64, reverse=True, scope="fragment")
+
+
+def scan_offset_subregion_test(H, W, r0, r1, op="cumsum", dim=0, reverse=False, dtype=T.float32):
+    """Feed a row-offset 2D sub-region of shared memory directly to the scan.
+
+    Regression for #2536: MakeAccessPtrFromRegion dropped the innermost dims'
+    ``min`` from the access-pointer offset, so a sub-region like
+    ``A_shared[r0:r1, :]`` with ``r0 != 0`` silently scanned rows ``[0:r1-r0]``.
+    """
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((H, W), dtype),
+        B: T.Tensor((H, W), dtype),
+    ):
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((H, W), dtype)
+            T.copy(A, A_shared)
+            scan = T.cumsum if op == "cumsum" else T.cummax
+            # Offset sub-region fed straight into the scan.
+            scan(src=A_shared[r0:r1, :], dim=dim, reverse=reverse)
+            T.copy(A_shared, B)
+
+    return main
+
+
+def run_scan_offset_subregion(H, W, r0, r1, op="cumsum", dim=0, reverse=False, dtype=T.float32):
+    program = scan_offset_subregion_test(H, W, r0, r1, op, dim, reverse, dtype)
+    jit_kernel = tl.compile(program, out_idx=-1)
+    A = torch.randn(H, W, dtype=getattr(torch, dtype)).cuda()
+
+    def ref_program(A):
+        ref_b = A.clone()  # rows outside [r0:r1] must be passed through untouched
+        chunk = A[r0:r1, :]
+        if op == "cumsum":
+            if reverse:
+                chunk = chunk.flip(dims=[dim]).cumsum(dim=dim).flip(dims=[dim])
+            else:
+                chunk = chunk.cumsum(dim=dim)
+        else:
+            chunk = _torch_cummax(chunk, dim, reverse)
+        ref_b[r0:r1, :] = chunk
+        return ref_b
+
+    tilelang_res = jit_kernel(A)
+    ref_res = ref_program(A)
+    torch.testing.assert_close(tilelang_res, ref_res, atol=1e-3, rtol=1e-3)
+
+
+def test_scan_offset_subregion():
+    """Regression for #2536: row-offset 2D shared sub-regions fed to the scan."""
+    H, W = 128, 8
+    for op in ("cumsum", "cummax"):
+        for dim in (0, 1):
+            for reverse in (False, True):
+                # r0 == 64 is the regressing case (r0 == 0 is already covered by
+                # the full-region region tests above).
+                run_scan_offset_subregion(H, W, 64, 128, op=op, dim=dim, reverse=reverse)
 
 
 if __name__ == "__main__":

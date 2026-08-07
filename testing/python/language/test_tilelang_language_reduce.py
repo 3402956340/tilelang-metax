@@ -4,6 +4,7 @@ import tilelang.language as T
 import tilelang.testing
 import pytest
 import torch
+from tilelang import tvm
 
 tilelang.testing.set_random_seed()
 
@@ -12,11 +13,21 @@ tilelang.testing.set_random_seed()
 # ---------------------------------------------------------------------------
 
 
-def _make_input(M, N, dtype):
+def _case_seed(*parts):
+    seed = 17
+    for text in map(str, parts):
+        for char in text:
+            seed = (seed * 131 + ord(char)) % (2**31 - 1)
+    return seed
+
+
+def _make_input(M, N, dtype, seed=42):
     torch_dtype = getattr(torch, dtype)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
     if torch_dtype in (torch.int32, torch.int64):
-        return torch.randint(-100, 100, (M, N), dtype=torch_dtype).cuda()
-    return torch.randn(M, N, dtype=torch_dtype).cuda()
+        return torch.randint(-100, 100, (M, N), dtype=torch_dtype, generator=generator).cuda()
+    return torch.randn(M, N, dtype=torch_dtype, generator=generator).cuda()
 
 
 def _ref(A, op):
@@ -86,7 +97,6 @@ REDUCE_CASES = [
 ]
 
 
-@tilelang.testing.pytest.mark.xfail
 @pytest.mark.parametrize(
     ("op", "dtype", "M", "N", "src_scope", "dst_scope", "threads", "batch"),
     REDUCE_CASES,
@@ -124,11 +134,100 @@ def test_reduce(op, dtype, M, N, src_scope, dst_scope, threads, batch):
         m = re.search(r",\s*(\d+)\s*,\s*\d+\s*>::run_batch\(", src)
         assert m is not None, f"Expected run_batch in generated source.\n{src}"
 
-    A = _make_input(M, N, dtype)
+    seed = _case_seed("reduce", op, dtype, M, N, src_scope, dst_scope, threads, batch)
+    A = _make_input(M, N, dtype, seed)
     B = jit_kernel(A)
     # float16/bfloat16 accumulate more rounding error over large reductions
     tol = 1e-1 if dtype in (T.float16, T.bfloat16) else 1e-2
     torch.testing.assert_close(B, _ref(A, op), atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize(
+    ("op", "packed_op"),
+    [("sum", "add2"), ("max", "max2"), ("min", "min2")],
+)
+def test_reduce_local_packed_codegen(op, packed_op):
+    @T.prim_func
+    def main(A: T.Tensor((8,), T.float16), B: T.Tensor((1,), T.float16)):
+        with T.Kernel(1, threads=1):
+            src = T.alloc_local((8,), T.float16)
+            dst = T.alloc_local((1,), T.float16)
+            for i in T.serial(8):
+                src[i] = A[i]
+            _reduce_op(T, op, src, dst, dim=0)
+            B[0] = dst[0]
+
+    target = {"kind": "maca"}
+    with tvm.transform.PassContext(), tvm.target.Target(target):
+        artifact = tilelang.lower(main, target=target)
+    assert f"tl::{packed_op}" in artifact.kernel_source
+
+
+@pytest.mark.parametrize(
+    ("op", "packed_op"),
+    [("sum", "add2"), ("max", "max2"), ("min", "min2")],
+)
+def test_reduce_local_noncontiguous_dim_packed_codegen(op, packed_op):
+    @T.prim_func
+    def main(A: T.Tensor((8, 4), T.float16), B: T.Tensor((4,), T.float16)):
+        with T.Kernel(1, threads=1):
+            src = T.alloc_local((8, 4), T.float16)
+            dst = T.alloc_local((4,), T.float16)
+            for i in T.serial(8):
+                for j in T.serial(4):
+                    src[i, j] = A[i, j]
+            _reduce_op(T, op, src, dst, dim=0)
+            for j in T.serial(4):
+                B[j] = dst[j]
+
+    target = {"kind": "maca"}
+    with tvm.transform.PassContext(), tvm.target.Target(target):
+        artifact = tilelang.lower(main, target=target)
+    assert f"tl::{packed_op}" in artifact.kernel_source
+
+
+@pytest.mark.parametrize(
+    ("op", "packed_op"),
+    [("sum", "add2"), ("max", "max2"), ("min", "min2")],
+)
+def test_reduce_local_to_var_packed_codegen(op, packed_op):
+    @T.prim_func
+    def main(A: T.Tensor((8,), T.float16), B: T.Tensor((1,), T.float16)):
+        with T.Kernel(1, threads=1):
+            src = T.alloc_local((8,), T.float16)
+            dst = T.alloc_var(T.float16)
+            for i in T.serial(8):
+                src[i] = A[i]
+            _reduce_op(T, op, src, dst, dim=0)
+            B[0] = dst
+
+    target = {"kind": "maca"}
+    with tvm.transform.PassContext(), tvm.target.Target(target):
+        artifact = tilelang.lower(main, target=target)
+    assert f"tl::{packed_op}" in artifact.kernel_source
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize("op", ["sum", "max", "min"])
+def test_reduce_local_packed_correctness(op):
+    @tilelang.jit(out_idx=-1)
+    def kernel():
+        @T.prim_func
+        def main(A: T.Tensor((8,), T.float16), B: T.Tensor((1,), T.float16)):
+            with T.Kernel(1, threads=1):
+                src = T.alloc_local((8,), T.float16)
+                dst = T.alloc_local((1,), T.float16)
+                for i in T.serial(8):
+                    src[i] = A[i]
+                _reduce_op(T, op, src, dst, dim=0)
+                B[0] = dst[0]
+
+        return main
+
+    jit_kernel = kernel()
+    A = torch.randn((8,), dtype=torch.float16, device="cuda")
+    B = jit_kernel(A)
+    torch.testing.assert_close(B[0], _ref(A.reshape(1, 8), op)[0], atol=1e-1, rtol=1e-1)
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +439,38 @@ def test_reduce_absmax_bf16_noncontiguous_packed_layout_regression():
     torch.testing.assert_close(B, ref, atol=0, rtol=0)
 
 
+@tilelang.testing.requires_cuda
+def test_reduce_sum_reshape_straddle_layout_regression():
+    tile_m = 2
+    hidden = 192
+    group = 6
+    group_k = 32
+    threads = 128
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((tile_m, hidden), T.float32),
+        B: T.Tensor((tile_m, group), T.float32),
+    ):
+        with T.Kernel(1, threads=threads):
+            src = T.alloc_fragment((tile_m, hidden), T.float32)
+            dst = T.alloc_fragment((tile_m, group), T.float32)
+
+            for i, j in T.Parallel(tile_m, hidden):
+                src[i, j] = A[i, j]
+
+            src_reshaped = T.reshape(src, (tile_m, group, group_k))
+            T.reduce_sum(src_reshaped, dst, dim=2)
+
+            for i, g in T.Parallel(tile_m, group):
+                B[i, g] = dst[i, g]
+
+    A = torch.arange(1, tile_m * hidden + 1, dtype=torch.float32, device="cuda").reshape(tile_m, hidden)
+    B = _compile(kernel)(A)
+    ref = A.reshape(tile_m, group, group_k).sum(dim=2)
+    torch.testing.assert_close(B, ref, atol=1e-3, rtol=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # nan_propagate tests – packed (vsize=2) path for bf16/fp16
 # ---------------------------------------------------------------------------
@@ -362,7 +493,7 @@ def _make_nan_reduce_kernel(reduce_fn, M, N, dtype, threads, *, nan_propagate):
     return kernel
 
 
-@tilelang.testing.pytest.mark.xfail
+@tilelang.testing.skip_on_maca
 @tilelang.testing.requires_cuda
 @tilelang.testing.requires_cuda_compute_version_ge(8, 9)
 def test_reduce_packed_fp8_to_float16_absmax_runtime():
@@ -393,7 +524,6 @@ def test_reduce_packed_fp8_to_float16_absmax_runtime():
     torch.testing.assert_close(B, ref, atol=0, rtol=0)
 
 
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 def test_reduce_packed_max_nan_propagate_uses_nan_intrinsics():
     k = _compile(_make_nan_reduce_kernel(T.reduce_max, 128, 128, T.float16, threads=256, nan_propagate=True))
@@ -402,7 +532,6 @@ def test_reduce_packed_max_nan_propagate_uses_nan_intrinsics():
     assert "tl::MaxOpNan" in src
 
 
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 def test_reduce_packed_min_nan_propagate_uses_nan_intrinsics():
     k = _compile(_make_nan_reduce_kernel(T.reduce_min, 128, 128, T.bfloat16, threads=256, nan_propagate=True))
@@ -411,7 +540,6 @@ def test_reduce_packed_min_nan_propagate_uses_nan_intrinsics():
     assert "tl::MinOpNan" in src
 
 
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 def test_reduce_packed_absmax_nan_propagate_uses_nan_intrinsics():
     k = _compile(_make_nan_reduce_kernel(T.reduce_absmax, 128, 128, T.float16, threads=256, nan_propagate=True))
@@ -420,7 +548,6 @@ def test_reduce_packed_absmax_nan_propagate_uses_nan_intrinsics():
     assert "tl::MaxOpNan" in src
 
 
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 def test_reduce_packed_max_nan_propagate_runtime():
     import math
@@ -434,7 +561,6 @@ def test_reduce_packed_max_nan_propagate_runtime():
         assert math.isnan(B[0].float().item()), f"{tl_dtype}: NaN row must produce NaN"
 
 
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 def test_reduce_packed_min_nan_propagate_runtime():
     import math
@@ -448,7 +574,6 @@ def test_reduce_packed_min_nan_propagate_runtime():
         assert math.isnan(B[1].float().item()), f"{tl_dtype}: NaN row must produce NaN"
 
 
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 def test_reduce_packed_max_nan_batch_runtime():
     import math

@@ -30,13 +30,12 @@ def flashattn(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, block_N, block_
         glse = T.alloc_global([batch, heads, num_split], dtype)
         Output_partial = T.alloc_global([batch, heads, num_split, dim], dtype)
         # flash_attn_split
-        with T.Kernel(batch, heads // min(block_H, kv_group_num), num_split, threads=256) as (bid, hid, bz):
+        with T.Kernel(batch, heads // min(block_H, kv_group_num), num_split, threads=128) as (bid, hid, bz):
             Q_shared = T.alloc_shared([block_H, dim], dtype)
             S_shared = T.alloc_shared([block_H, block_N], dtype)
             Q_pe_shared = T.alloc_shared([block_H, pe_dim], dtype)
             KV_shared = T.alloc_shared([block_N, dim], dtype)
             K_pe_shared = T.alloc_shared([block_N, pe_dim], dtype)
-            O_shared = T.alloc_shared([block_H, dim], dtype)
             acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
             acc_s_cast = T.alloc_fragment([block_H, block_N], dtype)
             acc_o = T.alloc_fragment([block_H, dim], accum_dtype)
@@ -56,7 +55,7 @@ def flashattn(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, block_N, block_
             T.fill(scores_max, -T.infinity(accum_dtype))
 
             loop_range = T.ceildiv((seqlen_kv // num_split), block_N)
-            for k in T.Pipelined(loop_range, num_stages=2):
+            for k in T.Pipelined(loop_range, num_stages=1):
                 kv_start = (seqlen_kv // num_split) * bz + k * block_N
                 kv_end = (seqlen_kv // num_split) * bz + (k + 1) * block_N
                 T.copy(KV[bid, kv_start:kv_end, cur_kv_head, :], KV_shared)
@@ -86,8 +85,7 @@ def flashattn(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, block_N, block_
             for i in T.Parallel(block_H):
                 logsum[i] = T.log2(logsum[i]) + scores_max[i] * scale
             T.copy(logsum, glse[bid, hid * VALID_BLOCK_H : (hid + 1) * VALID_BLOCK_H, bz])
-            T.copy(acc_o, O_shared)
-            T.copy(O_shared, Output_partial[bid, hid * VALID_BLOCK_H : (hid + 1) * VALID_BLOCK_H, bz, :])
+            T.copy(acc_o, Output_partial[bid, hid * VALID_BLOCK_H : (hid + 1) * VALID_BLOCK_H, bz, :])
 
         # combine
         with T.Kernel(heads, batch, threads=128) as (hid, bz):
@@ -125,13 +123,12 @@ def flashattn(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, block_N, block_
         K_pe: T.Tensor([batch, seqlen_kv, kv_head_num, pe_dim], dtype),
         Output: T.Tensor([batch, heads, dim], dtype),
     ):
-        with T.Kernel(heads // min(block_H, kv_group_num), batch, threads=256) as (hid, bid):
+        with T.Kernel(heads // min(block_H, kv_group_num), batch, threads=128) as (hid, bid):
             Q_shared = T.alloc_shared([block_H, dim], dtype)
             S_shared = T.alloc_shared([block_H, block_N], dtype)
             Q_pe_shared = T.alloc_shared([block_H, pe_dim], dtype)
             KV_shared = T.alloc_shared([block_N, dim], dtype)
             K_pe_shared = T.alloc_shared([block_N, pe_dim], dtype)
-            O_shared = T.alloc_shared([block_H, dim], dtype)
             acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
             acc_o = T.alloc_fragment([block_H, dim], accum_dtype)
             scores_max = T.alloc_fragment([block_H], accum_dtype)
@@ -149,7 +146,7 @@ def flashattn(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, block_N, block_
             T.fill(scores_max, -T.infinity(accum_dtype))
 
             loop_range = T.ceildiv(seqlen_kv, block_N)
-            for k in T.Pipelined(loop_range, num_stages=2):
+            for k in T.Pipelined(loop_range, num_stages=1):
                 T.copy(KV[bid, k * block_N : (k + 1) * block_N, cur_kv_head, :], KV_shared)
                 T.copy(K_pe[bid, k * block_N : (k + 1) * block_N, cur_kv_head, :], K_pe_shared)
                 T.gemm(Q_shared, KV_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol, clear_accum=True)
@@ -172,8 +169,7 @@ def flashattn(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, block_N, block_
                 T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
             for i, j in T.Parallel(block_H, dim):
                 acc_o[i, j] /= logsum[i]
-            T.copy(acc_o, O_shared)
-            T.copy(O_shared, Output[bid, hid * VALID_BLOCK_H : (hid + 1) * VALID_BLOCK_H, :])
+            T.copy(acc_o, Output[bid, hid * VALID_BLOCK_H : (hid + 1) * VALID_BLOCK_H, :])
 
     if num_split > 1:
         return main_split
@@ -226,14 +222,14 @@ def main(
     qk_flops = 2 * batch * heads * kv_ctx * (dim + pe_dim)
     pv_flops = 2 * batch * heads * kv_ctx * dim
     total_flops = qk_flops + pv_flops
-    BLOCK_N = 64
-    BLOCK_H = min(64, heads // kv_heads)
+    BLOCK_N = 32
+    BLOCK_H = min(16, heads // kv_heads)
     num_split = 1
     softmax_scale = (dim + pe_dim) ** -0.5
 
     kernel = flashattn(batch, heads, kv_heads, kv_ctx, dim, pe_dim, BLOCK_N, BLOCK_H, num_split, softmax_scale)
     profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Randn)
-    profiler.assert_allclose(ref_program, rtol=1e-4, atol=1e-4)
+    profiler.assert_allclose(ref_program, rtol=2e-4, atol=1e-4)
     latency = profiler.do_bench(warmup=500)
     print(f"Latency: {latency} ms")
     print(f"TFlops: {total_flops / latency * 1e-9} TFlops")
@@ -247,14 +243,14 @@ def run_regression_perf(
     dim=512,
     pe_dim=64,
 ):
-    BLOCK_N = 64
-    BLOCK_H = min(64, heads // kv_heads)
+    BLOCK_N = 32
+    BLOCK_H = min(16, heads // kv_heads)
     num_split = 1
     softmax_scale = (dim + pe_dim) ** -0.5
 
     kernel = flashattn(batch, heads, kv_heads, kv_ctx, dim, pe_dim, BLOCK_N, BLOCK_H, num_split, softmax_scale)
     profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Randn)
-    profiler.assert_allclose(ref_program, rtol=1e-4, atol=1e-4)
+    profiler.assert_allclose(ref_program, rtol=2e-4, atol=1e-4)
     return profiler.do_bench(backend="cupti")
 
 

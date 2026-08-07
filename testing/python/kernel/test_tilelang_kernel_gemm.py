@@ -96,7 +96,11 @@ def run_gemm(
             # float32 automatically, -0x1000 meas
             A = (A.view(torch.int32) - 0x1000).view(torch.float32)
             B = (B.view(torch.int32) - 0x1000).view(torch.float32)
+        if in_dtype == T.int8:
+            torch.backends.cuda.matmul.allow_tf32 = False
         C = torch.matmul(A.to(torch.float), B.to(torch.float))
+        if in_dtype == T.int8:
+            torch.backends.cuda.matmul.allow_tf32 = True
         C = C.to(torch.__getattribute__(out_dtype))
         return C
 
@@ -216,7 +220,6 @@ def test_gemm_i8i8i32_tn():
     run_gemm(512, 1024, 768, True, False, T.int8, T.int8, T.int32, 128, 128, 64)
 
 
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 def test_gemm_f64f64f64_nt():
     run_gemm(512, 512, 512, False, True, T.float64, T.float64, T.float64, 64, 32, 16)
@@ -410,8 +413,6 @@ def run_gemm_sr(
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
-# WGMMA only supports B in shared
-@tilelang.testing.requires_cuda_compute_version_le(8, 9)
 def test_gemm_f16f16f16_sr():
     run_gemm_sr(
         512,
@@ -530,7 +531,6 @@ def run_gemm_rs(
 
 
 # Register source A operand GMMAs must have K-major A layout.
-@tilelang.testing.requires_cuda_compute_version_le(8, 9)
 def test_gemm_f16f16f16_rs():
     run_gemm_rs(
         512,
@@ -545,6 +545,25 @@ def test_gemm_f16f16f16_rs():
         128,
         32,
         0,
+    )
+
+
+# MACA: plain float32 (not tfloat32) must lower TF32 MMA with float32x2 casts.
+# Existing test_gemm_f32f32f32_* use T.tfloat32 and miss this path.
+@tilelang.testing.requires_cuda
+def test_gemm_plain_float32_nt():
+    run_gemm(
+        64,
+        64,
+        64,
+        False,
+        True,
+        T.float32,
+        T.float32,
+        T.float32,
+        64,
+        64,
+        32,
     )
 
 

@@ -47,6 +47,7 @@ class TensorCoreIntrinEmitter:
         "float16": "fp16",
         "bfloat16": "bf16",
         "float32": "fp32",
+        "float64": "fp64",
         "int8": "int8",
         "int32": "int32",
         "float8_e4m3": "e4m3",
@@ -67,9 +68,9 @@ class TensorCoreIntrinEmitter:
 
     def __init__(
         self,
-        a_dtype: str = T.float16,
-        b_dtype: str = T.float16,
-        accum_dtype: str = T.float16,
+        a_dtype: str = "float16",
+        b_dtype: str = "float16",
+        accum_dtype: str = "float16",
         a_transposed: bool = False,
         b_transposed: bool = False,
         block_row_warps: int = 2,
@@ -111,7 +112,15 @@ class TensorCoreIntrinEmitter:
         self.num_elems_per_byte = num_elems_per_byte
         self.thread_var = thread_var
 
-    def _initialize_k_dim(self, a_dtype=T.float16):
+    def get_target_serial(self):
+        target = determine_target(return_object=True)
+        xcore = target.attrs.get("mcpu")
+        non_digits_part = xcore.rstrip("0123456789")
+        xcore_num = int(xcore[len(non_digits_part) :])
+        return xcore_num
+
+    def _initialize_k_dim(self, a_dtype="float16"):
+        serial = self.get_target_serial()
         if isinstance(a_dtype, str):
             if a_dtype in ["float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz"]:
                 self.k_dim = 32
@@ -119,18 +128,21 @@ class TensorCoreIntrinEmitter:
             a_dtype = DataType(a_dtype)
 
         if a_dtype.bits == 32:
-            self.k_dim = 8
+            if a_dtype in {T.tfloat32, T.float32}:
+                self.k_dim = 8
+            else:
+                self.k_dim = 4
+        elif a_dtype.bits == 64:
+            self.k_dim = 4
         elif a_dtype.bits == 16:
             self.k_dim = 16
         elif a_dtype.bits == 8:
-            target = determine_target(return_object=True)
-            mcpu = int(target.attrs["mcpu"][5:])
-            if mcpu >= 1500 and mcpu <= 1600:
+            if serial >= 1500 and serial <= 1600:
                 self.k_dim = 32
-            elif mcpu >= 1000 and mcpu < 1500:
+            elif serial >= 1000 and serial < 1500:
                 self.k_dim = 16
             else:
-                raise ValueError(f"Unsupported mcpu = {mcpu}")
+                raise ValueError("Unsupported MetaXGPU Card")
         else:
             raise ValueError(f"Unsupported a_dtype = {a_dtype}")
 
@@ -163,6 +175,7 @@ class TensorCoreIntrinEmitter:
             "bfloat16": "bf16",
             "float16": "f16",
             "float32": "tf32",
+            "float64": "f64",
             "int8": "i8",
             "float8_e4m3": "f8",
             "float8_e4m3fn": "f8",
@@ -256,7 +269,10 @@ class TensorCoreIntrinEmitter:
 
     def get_store_index_map(self, inverse: bool = False) -> IndexMap:
         warp_size, local_size_c = self.WARP_SIZE, self.local_size_out
-        index_map = IndexMap.from_func(mma_store_index_map, index_dtype=T.int32)
+        is_float64 = DataType(self.accum_dtype).bits == 64
+        index_map = IndexMap.from_func(
+            lambda thread_id, local_id: mma_store_index_map(thread_id, local_id, is_float64=is_float64), index_dtype=T.int32
+        )
         if not inverse:
             return index_map
         inverse_index_map = index_map.inverse([warp_size, local_size_c])
@@ -397,6 +413,58 @@ class TensorCoreIntrinEmitter:
     def mma(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer, k_inner: PrimExpr | None = 0):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
+
+        @T.macro
+        def _warp_mma(A_local_buf, B_local_buf, C_local_buf):
+            for i, j in T.grid(warp_rows, warp_cols):
+                self.mma_atom(A_local_buf, B_local_buf, C_local_buf, i, j, k_inner)
+
+        return _warp_mma(A_local_buf, B_local_buf, C_local_buf)
+
+    # ---- Atom-level interface ----
+
+    @property
+    def mma_num_inst_m(self) -> int:
+        """Number of MMA instruction atoms along the M dimension."""
+        return self.warp_rows
+
+    @property
+    def mma_num_inst_n(self) -> int:
+        """Number of MMA instruction atoms along the N dimension."""
+        return self.warp_cols
+
+    def mma_atom(
+        self,
+        A_local_buf: Buffer,
+        B_local_buf: Buffer,
+        C_local_buf: Buffer,
+        inst_m_idx: PrimExpr | int,
+        inst_n_idx: PrimExpr | int,
+        k_inner: PrimExpr | int = 0,
+    ):
+        """Emit a single MMA atom for tile (inst_m_idx, inst_n_idx).
+
+        This is the atomic building block of ``mma()``.  Calling this method
+        for every ``(i, j)`` in ``T.grid(mma_num_inst_m, mma_num_inst_n)``
+        produces identical TIR to a single ``mma()`` call.
+
+        Parameters
+        ----------
+        A_local_buf : Buffer
+            Fragment buffer for operand A.
+        B_local_buf : Buffer
+            Fragment buffer for operand B.
+        C_local_buf : Buffer
+            Accumulator fragment buffer.
+        inst_m_idx : int or PrimExpr
+            M-dimension atom index (0 .. mma_num_inst_m - 1).
+        inst_n_idx : int or PrimExpr
+            N-dimension atom index (0 .. mma_num_inst_n - 1).
+        k_inner : int or PrimExpr
+            K-inner step index used to offset A/B fragments.
+        """
+        warp_rows = self.warp_rows
+        warp_cols = self.warp_cols
         local_size_a = self.local_size_a
         local_size_b = self.local_size_b
         local_size_out = self.local_size_out
@@ -413,8 +481,8 @@ class TensorCoreIntrinEmitter:
         b_local_stride: PrimExpr = k_inner * warp_cols * k_pack * local_size_b if b_is_fragment else 0
 
         @T.macro
-        def _warp_mma(A_local_buf, B_local_buf, C_local_buf):
-            for kp, i, j in T.grid(k_pack, warp_rows, warp_cols):
+        def _atom_mma(A_local_buf, B_local_buf, C_local_buf):
+            for kp in T.grid(k_pack):
                 T.tvm_mfma(
                     mma_suffix,
                     "row",
@@ -423,15 +491,15 @@ class TensorCoreIntrinEmitter:
                     compute_b_dtype,
                     compute_out_dtype,
                     B_local_buf.data,
-                    (b_local_stride + (j * k_pack + kp) * local_size_b) // local_size_b,
+                    (b_local_stride + (inst_n_idx * k_pack + kp) * local_size_b) // local_size_b,
                     A_local_buf.data,
-                    (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a,
+                    (a_local_stride + (inst_m_idx * k_pack + kp) * local_size_a) // local_size_a,
                     C_local_buf.data,
-                    (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
+                    (inst_m_idx * warp_cols * local_size_out + inst_n_idx * local_size_out) // local_size_out,
                     dtype=compute_out_dtype,
                 )
 
-        return _warp_mma(A_local_buf, B_local_buf, C_local_buf)
+        return _atom_mma(A_local_buf, B_local_buf, C_local_buf)
 
     def stmatrix(self, C_local_buf, C_buf, pid_m=None, pid_n=None):
         block_row_warps = self.block_row_warps
@@ -446,13 +514,14 @@ class TensorCoreIntrinEmitter:
         M_DIM, N_DIM = self.M_DIM, self.N_DIM
         C_buf_dims = len(C_buf.shape)
         assert C_buf_dims in {2, 4}, "C_buf should be 2D or 4D"
+        is_float64 = DataType(self.accum_dtype).bits == 64
 
         @T.macro
         def _warp_stmatrix_shared(C_local_buf, C_buf, thread_binding):
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
             for i, j in T.grid(warp_rows, warp_cols):
                 for local_id in T.vectorized(local_size_out):
-                    row, col = T.meta_var(mma_store_index_map(tx, local_id))
+                    row, col = T.meta_var(mma_store_index_map(tx, local_id, is_float64=is_float64))
                     if C_buf_dims == 2:
                         C_buf[(warp_m * warp_rows + i) * M_DIM + row, (warp_n * warp_cols + j) * N_DIM + col] = C_local_buf[
                             i * (warp_cols * local_size_out) + j * local_size_out + local_id
@@ -467,7 +536,7 @@ class TensorCoreIntrinEmitter:
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
             for i, j in T.grid(warp_rows, warp_cols):
                 for local_id in T.vectorized(local_size_out):
-                    row, col = T.meta_var(mma_store_index_map(tx, local_id))
+                    row, col = T.meta_var(mma_store_index_map(tx, local_id, is_float64=is_float64))
                     C_buf[
                         (pid_m * BLOCK_M + warp_m * warp_rows + i) * M_DIM + row, (pid_n * BLOCK_N + warp_n * warp_cols + j) * N_DIM + col
                     ] = C_local_buf[i * warp_cols * local_size_out + j * local_size_out + local_id]
@@ -705,9 +774,9 @@ class TensorCoreIntrinEmitter:
 class TensorCorePreshuffleIntrinEmitter(TensorCoreIntrinEmitter):
     def __init__(
         self,
-        a_dtype: str = T.float16,
-        b_dtype: str = T.float16,
-        accum_dtype: str = T.float16,
+        a_dtype: str = "float16",
+        b_dtype: str = "float16",
+        accum_dtype: str = "float16",
         a_transposed: bool = False,
         b_transposed: bool = False,
         block_row_warps: int = 2,

@@ -28,13 +28,128 @@ struct SumOp {
 
 struct MaxOp {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
-    return mctlass::fast_max(x, y);
+    return max(x, y);
   }
 };
 
 struct MinOp {
   template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
-    return mctlass::fast_min(x, y);
+    return min(x, y);
+  }
+};
+
+struct MaxOpNan {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return max(x, y);
+  }
+  TL_DEVICE bfloat16_t operator()(bfloat16_t const &x, bfloat16_t const &y) {
+    return __hmax_nan(x, y);
+  }
+  TL_DEVICE half_t operator()(half_t const &x, half_t const &y) {
+    return half_t(__hmax_nan(x, y));
+  }
+};
+
+struct MinOpNan {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) {
+    return min(x, y);
+  }
+  TL_DEVICE bfloat16_t operator()(bfloat16_t const &x, bfloat16_t const &y) {
+    return __hmin_nan(x, y);
+  }
+  TL_DEVICE half_t operator()(half_t const &x, half_t const &y) {
+    return half_t(__hmin_nan(x, y));
+  }
+};
+
+// Packed x2 reduce operators for bf16x2 and fp16x2
+// These operate on uint1 (packed 32-bit) values
+
+struct SumOp_bf16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) const {
+    return tl::to_uint1(tl::add2(tl::from_uint1<maca_bfloat162>(x),
+                                 tl::from_uint1<maca_bfloat162>(y)));
+  }
+};
+
+struct MaxOp_bf16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) const {
+    return tl::to_uint1(tl::max2(tl::from_uint1<maca_bfloat162>(x),
+                                 tl::from_uint1<maca_bfloat162>(y)));
+  }
+};
+
+struct MinOp_bf16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) const {
+    return tl::to_uint1(tl::min2(tl::from_uint1<maca_bfloat162>(x),
+                                 tl::from_uint1<maca_bfloat162>(y)));
+  }
+};
+
+struct SumOp_fp16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) const {
+    return tl::to_uint1(
+        tl::add2(tl::from_uint1<half2>(x), tl::from_uint1<half2>(y)));
+  }
+};
+
+struct MaxOp_fp16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) const {
+    return tl::to_uint1(
+        tl::max2(tl::from_uint1<half2>(x), tl::from_uint1<half2>(y)));
+  }
+};
+
+struct MinOp_fp16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) const {
+    return tl::to_uint1(
+        tl::min2(tl::from_uint1<half2>(x), tl::from_uint1<half2>(y)));
+  }
+};
+
+struct MaxOpNan_bf16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) const {
+    return tl::to_uint1(tl::max2_nan(tl::from_uint1<bfloat16x2>(x),
+                                     tl::from_uint1<bfloat16x2>(y)));
+  }
+};
+
+struct MinOpNan_bf16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) const {
+    return tl::to_uint1(tl::min2_nan(tl::from_uint1<bfloat16x2>(x),
+                                     tl::from_uint1<bfloat16x2>(y)));
+  }
+};
+
+struct MaxOpNan_fp16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) const {
+    return tl::to_uint1(tl::max2_nan(tl::from_uint1<float16x2>(x),
+                                     tl::from_uint1<float16x2>(y)));
+  }
+};
+
+struct MinOpNan_fp16x2 {
+  template <typename T> TL_DEVICE T operator()(T const &x, T const &y) const {
+    return tl::to_uint1(tl::min2_nan(tl::from_uint1<float16x2>(x),
+                                     tl::from_uint1<float16x2>(y)));
+  }
+};
+
+struct SumOp_f32x2 {
+  TL_DEVICE float2 operator()(float2 const &x, float2 const &y) {
+    return tl::add2(x, y);
+  }
+};
+
+struct MaxOp_f32x2 {
+  TL_DEVICE float2 operator()(float2 const &x, float2 const &y) {
+    return tl::max2(x, y);
+  }
+};
+
+struct MinOp_f32x2 {
+  TL_DEVICE float2 operator()(float2 const &x, float2 const &y) {
+    return tl::min2(x, y);
   }
 };
 
@@ -185,94 +300,4 @@ template <typename T> TL_DEVICE T warp_reduce_bitor(T value) {
   return warp_reduce<T>(value, BitOrOp());
 }
 
-template <int threads, int Axis = 0, bool reverse = false> struct CumSum2D {
-  static_assert(threads == 1024 or threads == 512 or threads == 256 or
-                threads == 128 or threads == 64);
-  template <typename T, int SEG = 64>
-  static TL_DEVICE void run(const T *__restrict__ src, T *__restrict__ dst,
-                            int H, int W) {
-
-    constexpr int TILE_H = threads / SEG;
-    constexpr unsigned long MASK = 0xFFFFFFFFFFFFFFFF;
-    const int num_blocks = (H + TILE_H - 1) / TILE_H;
-    const int tid = threadIdx.x;
-    const int lane = tid % SEG;
-    const int row = tid / SEG;
-
-    for (int b = 0; b < num_blocks; ++b) {
-      const int gRow = b * TILE_H + row;
-      if (gRow >= H)
-        continue;
-
-      T carry = (T)0;
-
-      if (reverse) {
-        // Start from the last segment for reverse mode
-        for (int seg = (W + SEG - 1) / SEG - 1; seg >= 0; --seg) {
-          const int col = seg * SEG + lane;
-
-          const int real_row = (Axis == 1) ? gRow : col;
-          const int real_col = (Axis == 1) ? col : gRow;
-
-          T val = (col < W && real_row < H && real_col < W)
-                      ? src[real_row * W + real_col]
-                      : (T)0;
-
-#pragma unroll
-          for (int off = 1; off < SEG; off <<= 1) {
-            T n = __shfl_down_sync(MASK, val, off);
-            if (lane < SEG - off)
-              val += n;
-          }
-
-          val += carry;
-
-          if (real_col < W && real_row < H)
-            dst[real_row * W + real_col] = val;
-
-          T segSum = __shfl_sync(MASK, val, 0);
-          if (lane == 0)
-            carry = segSum;
-          carry = __shfl_sync(MASK, carry, 0);
-        }
-      } else {
-        for (int seg = 0; seg * SEG < W; ++seg) {
-          const int col = seg * SEG + lane;
-
-          const int real_row = (Axis == 1) ? gRow : col;
-          const int real_col = (Axis == 1) ? col : gRow;
-
-          T val = (col < W && real_row < H && real_col < W)
-                      ? src[real_row * W + real_col]
-                      : (T)0;
-
-#pragma unroll
-          for (int off = 1; off < SEG; off <<= 1) {
-            T n = __shfl_up_sync(MASK, val, off);
-            if (lane >= off)
-              val += n;
-          }
-
-          val += carry;
-
-          if (real_col < W && real_row < H)
-            dst[real_row * W + real_col] = val;
-
-          T segSum = __shfl_sync(MASK, val, SEG - 1);
-          if (lane == SEG - 1)
-            carry = segSum;
-          carry = __shfl_sync(MASK, carry, SEG - 1);
-        }
-      }
-    }
-  }
-};
-
-template <int threads, bool reverse = false> struct CumSum1D {
-  template <typename T>
-  static TL_DEVICE void run(const T *__restrict__ src, T *__restrict__ dst,
-                            int N) {
-    CumSum2D<threads, 1, reverse>::run(src, dst, 1, N);
-  }
-};
 } // namespace tl

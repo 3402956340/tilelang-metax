@@ -32,6 +32,8 @@ public:
   Buffer src, dst;                   // Source and destination buffers
   Array<Range> src_range, dst_range; // Ranges for each dimension in src and dst
   Optional<PrimExpr> dst_block;      // Destination block index for cluster copy
+  // Annotated source OOB fallback value resolved from the enclosing block.
+  Optional<PrimExpr> src_oob_safe_value;
   Map<String, ObjectRef> annotations; // Backend/pass-specific annotations.
   // Common SIMT annotation keys:
   //   - "coalesced_width": IntImm, width for coalesced memory access.
@@ -52,28 +54,31 @@ public:
         .def_ro("src_range", &CopyNode::src_range)
         .def_ro("dst_range", &CopyNode::dst_range)
         .def_ro("dst_block", &CopyNode::dst_block)
+        .def_ro("src_oob_safe_value", &CopyNode::src_oob_safe_value)
         .def_ro("annotations", &CopyNode::annotations);
   }
 
   /*!
    * \brief Lower the copy operator to a TIR statement.
-   * \param T        Arguments for lowering.
+   * \param lower_args Arguments for lowering.
    * \param analyzer Analyzer for simplification and bounds checks.
    */
-  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
+  Stmt Lower(const LowerArgs &lower_args,
+             arith::Analyzer *analyzer) const override;
 
   /*!
    * \brief Infer buffer layouts after applying this operator.
-   * \param T     Arguments for layout inference.
+   * \param layout_args Arguments for layout inference.
    * \param level Level of inference (basic or detailed).
    */
-  LayoutMap InferLayout(const LayoutInferArgs &T,
+  LayoutMap InferLayout(const LayoutInferArgs &layout_args,
                         InferLevel level) const override;
 
   /*!
    * \brief Infer layout through the generated SIMT copy loop.
    */
-  LayoutMap InferSIMTLayout(const LayoutInferArgs &T, InferLevel level) const;
+  LayoutMap InferSIMTLayout(const LayoutInferArgs &layout_args,
+                            InferLevel level) const;
 
   /*!
    * \brief Generate lowering for MACA memory async copy (memcpy_async).
@@ -137,16 +142,17 @@ struct CopyImpl {
   CopyTargetPredicate match_target;
   int priority;
 
-  LayoutMap (*infer_layout)(const CopyNode &op, const LayoutInferArgs &T,
+  LayoutMap (*infer_layout)(const CopyNode &op,
+                            const LayoutInferArgs &layout_args,
                             InferLevel level);
 
-  Stmt (*lower)(const CopyNode &op, const LowerArgs &T,
+  Stmt (*lower)(const CopyNode &op, const LowerArgs &lower_args,
                 arith::Analyzer *analyzer);
 };
 
 void RegisterCopyImpl(CopyImpl impl);
 
-Stmt LowerNormalCopy(const CopyNode &op, const LowerArgs &T,
+Stmt LowerNormalCopy(const CopyNode &op, const LowerArgs &lower_args,
                      arith::Analyzer *analyzer);
 
 class Copy : public TileOperator {
@@ -207,12 +213,13 @@ public:
   /*!
    * \brief Lower to TIR statement.
    */
-  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
+  Stmt Lower(const LowerArgs &lower_args,
+             arith::Analyzer *analyzer) const override;
 
   /*!
    * \brief Infer layout for this operator.
    */
-  LayoutMap InferLayout(const LayoutInferArgs &T,
+  LayoutMap InferLayout(const LayoutInferArgs &layout_args,
                         InferLevel level) const override;
 
   /*!
@@ -227,7 +234,7 @@ struct Im2ColImpl {
   CopyTargetPredicate match_target;
   int priority;
 
-  Stmt (*lower)(const Im2ColOpNode &op, const LowerArgs &T,
+  Stmt (*lower)(const Im2ColOpNode &op, const LowerArgs &lower_args,
                 arith::Analyzer *analyzer);
 };
 

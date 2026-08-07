@@ -5,10 +5,9 @@
 
 #include "cuda/op/copy.h"
 #include "support/check.h"
-#include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/runtime/logging.h>
 
-#include "backend/common/target_utils.h"
+#include "cuda/target_utils.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 
@@ -265,6 +264,24 @@ bool CheckBulkStore(const CopyNode &op, Target target,
   return CheckGlobalStrides(op.dst, analyzer, emit_diagnostics);
 }
 
+bool IsSemanticallyLinearLayout(const Layout &layout,
+                                const Array<PrimExpr> &shape,
+                                arith::Analyzer *analyzer) {
+  Array<PrimExpr> input_shape = layout->InputShape();
+  if (input_shape.size() != shape.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (!analyzer->CanProveEqual(input_shape[i], shape[i])) {
+      return false;
+    }
+  }
+
+  Layout linear_layout = MakeLinearLayout(shape);
+  return analyzer->CanProveEqual(layout->GetLinearizedForwardIndex(),
+                                 linear_layout->GetLinearizedForwardIndex());
+}
+
 bool CheckBulkCopy1D(const Buffer &global_tensor, const Buffer &shared_tensor,
                      const Array<Range> &global_range,
                      const Array<Range> &shared_range,
@@ -273,8 +290,8 @@ bool CheckBulkCopy1D(const Buffer &global_tensor, const Buffer &shared_tensor,
   if (layout_map.count(shared_tensor)) {
     Layout existing =
         layout_map.Get(shared_tensor).value().as<Layout>().value();
-    Layout linear_layout = makeLinearLayout(shared_tensor->shape);
-    shared_is_contiguous = StructuralEqual()(existing, linear_layout);
+    shared_is_contiguous =
+        IsSemanticallyLinearLayout(existing, shared_tensor->shape, analyzer);
   }
 
   bool global_is_contiguous = true;
@@ -300,13 +317,46 @@ bool CheckBulkCopy1D(const Buffer &global_tensor, const Buffer &shared_tensor,
   for (size_t i = 0; i < shared_range.size(); i++) {
     shared_elements *= shared_range[i]->extent;
   }
+
   PrimExpr global_elements = 1;
   for (size_t i = 0; i < global_range.size(); i++) {
     global_elements *= global_range[i]->extent;
   }
+
   bool element_match =
       analyzer->CanProveEqual(shared_elements, global_elements);
-  return shared_is_contiguous && global_is_contiguous && element_match;
+
+  PrimExpr total_bits = shared_elements * shared_tensor->dtype.bits();
+
+  // Reject only when the total transfer size is provably not 16-byte
+  // aligned (e.g. constant shapes like 63 x fp32). Symbolic shapes stay on
+  // the 1D TMA path, consistent with the last-dim check in CheckBulkLoad.
+  bool total_16b_aligned = !analyzer->CanProve(
+      FloorMod(total_bits, 128) != 0, arith::ProofStrength::kSymbolicBound);
+
+  return shared_is_contiguous && global_is_contiguous && element_match &&
+         total_16b_aligned;
+}
+
+bool CanProveRegionInBounds(const Buffer &buffer, const Array<Range> &region,
+                            arith::Analyzer *analyzer) {
+  if (buffer->shape.size() != region.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < region.size(); ++i) {
+    PrimExpr min = region[i]->min;
+    PrimExpr extent = region[i]->extent;
+    if (!analyzer->CanProve(min >= 0 && min + extent <= buffer->shape[i],
+                            arith::ProofStrength::kSymbolicBound)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool CanProveCopyInBounds(const CopyNode &op, arith::Analyzer *analyzer) {
+  return CanProveRegionInBounds(op.src, op.src_range, analyzer) &&
+         CanProveRegionInBounds(op.dst, op.dst_range, analyzer);
 }
 
 bool CheckBulkLoad1D(const CopyNode &op, Target target,
@@ -356,7 +406,7 @@ bool CheckCPAsyncCopyPreconditions(const CopyNode &op) {
 
 bool CheckCPAsyncCopy(const CopyNode &op, Target target,
                       const LayoutMap &layout_map, arith::Analyzer *analyzer) {
-  if (!TargetHasAsyncCopy(target)) {
+  if (!TargetCudaHasAsyncCopy(target)) {
     return false;
   }
   if (!CheckCPAsyncCopyPreconditions(op)) {
@@ -472,7 +522,7 @@ std::string MakeAsyncUnavailableReason(const CopyNode &op, Target target) {
   std::ostringstream oss;
   if (!target.defined()) {
     oss << "T.async_copy requires a defined target.";
-  } else if (!TargetHasAsyncCopy(target)) {
+  } else if (!TargetCudaHasAsyncCopy(target)) {
     oss << "T.async_copy is only supported on targets with cp.async support "
            "(SM80+). Got target="
         << target;
@@ -566,7 +616,7 @@ CopyFacts AnalyzeCopyFacts(const CopyNode &op, const CopyAnalysisContext &ctx) {
       ctx.layout_map != nullptr ? *ctx.layout_map : empty_layout_map;
   bool is_cutedsl = TargetIsCuTeDSL(ctx.target);
   facts.layout_dependent_tma_available =
-      facts.has_layout_map && !is_cutedsl && !ctx.buffer_oob;
+      facts.has_layout_map && !is_cutedsl && CanProveCopyInBounds(op, analyzer);
 
   if (facts.layout_dependent_tma_available) {
     facts.can_bulk_load_1d =
@@ -594,15 +644,15 @@ CopyFacts AnalyzeCopyFacts(const CopyNode &op, const CopyAnalysisContext &ctx) {
   if (facts.can_bulk_store_1d) {
     facts.can_bulk_store_ignore_last_dim = true;
     facts.can_bulk_store =
-        CheckBulkStore(op, ctx.target, analyzer, /*check_last_dim=*/true,
-                       ctx.emit_diagnostics);
+        CheckBulkStore(op, ctx.target, analyzer,
+                       /*check_last_dim=*/true, ctx.emit_diagnostics);
   } else {
     facts.can_bulk_store_ignore_last_dim =
-        CheckBulkStore(op, ctx.target, analyzer, /*check_last_dim=*/false,
-                       ctx.emit_diagnostics);
+        CheckBulkStore(op, ctx.target, analyzer,
+                       /*check_last_dim=*/false, ctx.emit_diagnostics);
     facts.can_bulk_store =
-        CheckBulkStore(op, ctx.target, analyzer, /*check_last_dim=*/true,
-                       ctx.emit_diagnostics);
+        CheckBulkStore(op, ctx.target, analyzer,
+                       /*check_last_dim=*/true, ctx.emit_diagnostics);
   }
 
   facts.can_cp_async = CheckCPAsyncCopy(op, ctx.target, layout_map, analyzer);
@@ -701,39 +751,6 @@ CopyInstSelection SelectCopyInstForLowering(const CopyNode &op,
   }
 
   return Supported(SelectSyncLikeInst(facts));
-}
-
-std::string ClassifyCopyForInstructionAnnotation(const CopyNode &op,
-                                                 Target target,
-                                                 bool in_pipeline) {
-  CopyAnalysisContext ctx;
-  ctx.target = target;
-  CopyFacts facts = AnalyzeCopyFacts(op, ctx);
-  if (!facts.cuda_like_target) {
-    return "sync";
-  }
-
-  if (facts.cluster_mask != 0) {
-    return facts.can_bulk_load ? "tma" : "sync";
-  }
-
-  if (facts.explicit_tma) {
-    CopyInst inst =
-        SelectTmaInst(facts, /*allow_load=*/true, /*allow_store=*/true,
-                      /*check_last_dim=*/false);
-    return CopyInstIsTMA(inst) ? "tma" : "sync";
-  }
-
-  if (facts.explicit_cp_async || facts.no_implicit_async_commit_wait) {
-    return facts.can_cp_async ? "cp_async" : "sync";
-  }
-
-  if (in_pipeline && IsAutoAsyncCopyEnabled(/*default_enabled=*/false) &&
-      facts.can_cp_async) {
-    return "cp_async";
-  }
-
-  return "sync";
 }
 
 CopyInstSelection ClassifyWarpSpecializedProducerCopy(const CopyNode &op,

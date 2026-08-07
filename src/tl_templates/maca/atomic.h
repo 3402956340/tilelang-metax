@@ -243,11 +243,12 @@ template <typename T> TL_DEVICE half2 ToHalf2(T val) {
 
 TL_DEVICE half2 ToHalf2(half2 val) { return val; }
 
-TL_DEVICE half2 ToHalf2(float2 val) {
-  half2 ret;
-  ret.x = static_cast<half_t>(val.x);
-  ret.y = static_cast<half_t>(val.y);
-  return ret;
+TL_DEVICE half2 ToHalf2(float2 val) { return __floats2half2_rn(val.x, val.y); }
+TL_DEVICE half2 ToHalf2(const float *val) {
+  return __floats2half2_rn(val[0], val[1]);
+}
+TL_DEVICE half2 ToHalf2(float *val) {
+  return ToHalf2(static_cast<const float *>(val));
 }
 
 // Here ValType can be either value or value* (pointer)
@@ -269,6 +270,16 @@ template <typename T> TL_DEVICE maca_bfloat162 ToBfloat162(T val) {
 }
 
 TL_DEVICE maca_bfloat162 ToBfloat162(maca_bfloat162 val) { return val; }
+
+TL_DEVICE maca_bfloat162 ToBfloat162(float2 val) {
+  return __floats2bfloat162_rn(val.x, val.y);
+}
+TL_DEVICE maca_bfloat162 ToBfloat162(const float *val) {
+  return __floats2bfloat162_rn(val[0], val[1]);
+}
+TL_DEVICE maca_bfloat162 ToBfloat162(float *val) {
+  return ToBfloat162(static_cast<const float *>(val));
+}
 
 template <typename ValType>
 TL_DEVICE void AtomicAddx2(bfloat16_t *ref, ValType val,
@@ -309,6 +320,27 @@ TL_DEVICE float2 AtomicAddx2Ret(float *ref, ValType val, int memory_order = 0) {
   return ret;
 }
 
+template <typename ValType>
+TL_DEVICE half2 AtomicAddx2Ret(half_t *ref, ValType val, int memory_order = 0) {
+  (void)memory_order;
+  half2 add_val = ToHalf2(val);
+  half2 ret;
+  ret.x = atomicAdd(ref + 0, add_val.x);
+  ret.y = atomicAdd(ref + 1, add_val.y);
+  return ret;
+}
+
+template <typename ValType>
+TL_DEVICE __maca_bfloat162 AtomicAddx2Ret(bfloat16_t *ref, ValType val,
+                                          int memory_order = 0) {
+  (void)memory_order;
+  __maca_bfloat162 add_val = *reinterpret_cast<const __maca_bfloat162 *>(val);
+  __maca_bfloat162 ret;
+  ret.x = atomicAdd(ref + 0, add_val.x);
+  ret.y = atomicAdd(ref + 1, add_val.y);
+  return ret;
+}
+
 // Scalar fallback for float AtomicAddx4
 template <typename dst_dtype, typename ValType>
 TL_DEVICE void AtomicAddx4(dst_dtype *ref, ValType val, int memory_order = 0) {
@@ -318,6 +350,19 @@ TL_DEVICE void AtomicAddx4(dst_dtype *ref, ValType val, int memory_order = 0) {
   atomicAdd(ref + 1, add_val.y);
   atomicAdd(ref + 2, add_val.z);
   atomicAdd(ref + 3, add_val.w);
+}
+
+template <typename SrcType>
+TL_DEVICE void AtomicAddx4(half_t *ref, SrcType *val, int memory_order = 0) {
+  AtomicAddx2(ref, val, memory_order);
+  AtomicAddx2(ref + 2, val + 2, memory_order);
+}
+
+template <typename SrcType>
+TL_DEVICE void AtomicAddx4(bfloat16_t *ref, SrcType *val,
+                           int memory_order = 0) {
+  AtomicAddx2(ref, val, memory_order);
+  AtomicAddx2(ref + 2, val + 2, memory_order);
 }
 
 template <typename dst_dtype, typename ValType>
@@ -333,6 +378,32 @@ TL_DEVICE float4 AtomicAddx4Ret(dst_dtype *ref, ValType val,
   return ret;
 }
 
+// No single-atomic fp16x4 exists, so this is two per-pair AtomicAddx2Ret
+// (per-pair atomic, like the fp32-x4 fallback). Returns uint2 (the half4 store
+// type): the two half2 packed.
+template <typename SrcType>
+TL_DEVICE uint2 AtomicAddx4Ret(half_t *ref, SrcType *val,
+                               int memory_order = 0) {
+  half2 prev_lo = AtomicAddx2Ret(ref, val, memory_order);
+  half2 prev_hi = AtomicAddx2Ret(ref + 2, val + 2, memory_order);
+  uint2 ret;
+  ret.x = *reinterpret_cast<const unsigned int *>(&prev_lo);
+  ret.y = *reinterpret_cast<const unsigned int *>(&prev_hi);
+  return ret;
+}
+
+// bf16 counterpart of the fp16 AtomicAddx4Ret above.
+template <typename SrcType>
+TL_DEVICE uint2 AtomicAddx4Ret(bfloat16_t *ref, SrcType *val,
+                               int memory_order = 0) {
+  __maca_bfloat162 prev_lo = AtomicAddx2Ret(ref, val, memory_order);
+  __maca_bfloat162 prev_hi = AtomicAddx2Ret(ref + 2, val + 2, memory_order);
+  uint2 ret;
+  ret.x = *reinterpret_cast<const unsigned int *>(&prev_lo);
+  ret.y = *reinterpret_cast<const unsigned int *>(&prev_hi);
+  return ret;
+}
+
 // AtomicLoad / AtomicStore
 template <typename T> TL_DEVICE T AtomicLoad(T *ref, int memory_order) {
   (void)memory_order;
@@ -345,4 +416,21 @@ TL_DEVICE void AtomicStore(T1 *ref, T2 value, int memory_order) {
   (void)memory_order;
   volatile T1 *vref = reinterpret_cast<volatile T1 *>(ref);
   *vref = static_cast<T1>(value);
+}
+
+// Add an extra unused input to accommodate the additional 'memory_order'
+// argument during lowering.
+template <typename T1, typename T2>
+__forceinline__ __device__ void AtomicOr(T1 *address, T2 val,
+                                         int memory_order = 0) {
+  atomicOr(reinterpret_cast<T1 *>(address), static_cast<T1>(val));
+}
+
+// Add an extra unused input to accommodate the additional 'memory_order'
+// argument during lowering.
+// Overload for when the first argument is a value instead of a pointer.
+template <typename T1, typename T2>
+__forceinline__ __device__ void AtomicOr(T1 &address, T2 val,
+                                         int memory_order = 0) {
+  atomicOr(reinterpret_cast<T1 *>(&address), static_cast<T1>(val));
 }

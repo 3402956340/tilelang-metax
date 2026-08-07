@@ -3,7 +3,7 @@ from tilelang import language as T
 from typing import Optional, Callable, Any
 import torch
 from tilelang import DataType
-from tilelang.quantize import (
+from quantize import (
     _tir_packed_int_to_int_convert,
 )
 
@@ -199,7 +199,7 @@ def main() -> None:
     C = torch.zeros(M, N, dtype=getattr(torch, accum_dtype)).cuda()
 
     if fast_decoding:
-        from tilelang.quantize.utils import interleave_weight
+        from quantize.utils import interleave_weight
 
         qB = interleave_weight(qB, num_bits, in_dtype)
     kernel(A, qB, C)
@@ -261,7 +261,7 @@ def run_regression_perf():
     C = torch.zeros(M, N, dtype=getattr(torch, accum_dtype)).cuda()
 
     if fast_decoding:
-        from tilelang.quantize.utils import interleave_weight
+        from quantize.utils import interleave_weight
 
         qB = interleave_weight(qB, num_bits, in_dtype)
     kernel(A, qB, C)

@@ -8,6 +8,7 @@ from tvm.tirx import PrimFunc
 import tilelang
 from tilelang import tvm
 from tilelang import env
+from tilelang.env import resolve_pass_profile_threshold_ms
 from tilelang.backend.execution_backend import resolve_execution_backend_spec
 from tvm.target import Target
 from tilelang.engine.param import CompiledArtifact, KernelParam
@@ -23,8 +24,10 @@ from tilelang.profiler import Profiler, TensorSupplyType
 from tilelang.backend.target import determine_target
 from tilelang.contrib import nvcc as tl_nvcc
 from tilelang.contrib.hip_resource_info import pop_recorded, reset_recorder
+from tilelang.jit.diagnostics import jit_phase
 from tilelang.transform import PassConfigKey
 from tilelang.transform.pass_config import normalize_pass_configs
+from tilelang.utils.pass_timing import build_pass_instruments, report_pass_timing_on_exit
 import logging
 import os
 
@@ -32,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
-TargetLike = str | Target
+TargetLike = str | dict[str, object] | Target
 
 
 class JITKernel(Generic[_P, _T]):
@@ -83,9 +86,10 @@ class JITKernel(Generic[_P, _T]):
             Index(es) of the output tensors to return (default: None).
         execution_backend : Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
             Execution backend to use for kernel execution.
-        target : str or tvm.target.Target, optional
-            Compilation target (default: "auto").
-        target_host : str or tvm.target.Target, optional
+        target : str, dict, or tvm.target.Target, optional
+            Compilation target (default: "auto"). Use a dict for target attributes,
+            for example {"kind": "cuda", "arch": "sm_90"}.
+        target_host : str, dict, or tvm.target.Target, optional
             Target host for cross-compilation (default: None).
         verbose : bool, optional
             Whether to enable verbose output (default: False).
@@ -232,16 +236,44 @@ class JITKernel(Generic[_P, _T]):
         enable_device_compile = self.execution_backend_spec.enable_device_compile
 
         # Additional pass instruments
-        pass_instruments = []
+        base_pass_instruments = []
         if pass_configs.get(PassConfigKey.TL_ENABLE_DUMP_IR):
             dump_ir_path = pass_configs.get(PassConfigKey.TL_DUMP_IR_DIR, "./dump_ir")  # Default dump path
-            pass_instruments.append(tvm.ir.instrument.DumpIR(dump_dir=dump_ir_path))
+            base_pass_instruments.append(tvm.ir.instrument.DumpIR(dump_dir=dump_ir_path))
+
+        # Pass timing instrument
+        profile_threshold_ms = None
+        if pass_configs.get(PassConfigKey.TL_PASS_PROFILE) or env.is_pass_profile_enabled():
+            profile_threshold_ms = resolve_pass_profile_threshold_ms(
+                pass_configs,
+                PassConfigKey.TL_PASS_PROFILE_THRESHOLD_MS,
+                env.get_pass_profile_threshold_ms,
+            )
+        pass_instruments, timing_instrument = build_pass_instruments(
+            base_pass_instruments,
+            profile_threshold_ms,
+        )
 
         # open a recorder window for kernel-resource-usage remarks
         capture_resources = is_hip_target(target)
         if capture_resources:
             reset_recorder()
-        with tvm.transform.PassContext(opt_level=3, config=pass_configs, instruments=pass_instruments), self.target:
+        func_name = tilelang_func.attrs.get("global_symbol", "<unknown>")
+        phase_context = {
+            "kernel": func_name,
+            "target": str(target),
+            "target_host": str(target_host) if target_host is not None else None,
+            "backend": execution_backend,
+        }
+        with (
+            report_pass_timing_on_exit(
+                timing_instrument,
+                context=f"stage=jit-lower, kernel={func_name}, backend={execution_backend}",
+            ),
+            jit_phase("lower", verbose=verbose, **phase_context),
+            tvm.transform.PassContext(opt_level=3, config=pass_configs, instruments=pass_instruments),
+            self.target,
+        ):
             artifact = tilelang.lower(
                 tilelang_func,
                 target=target,
@@ -252,12 +284,17 @@ class JITKernel(Generic[_P, _T]):
 
         self.artifact = artifact
 
+        def create_adapter(adapter_cls: Callable[..., BaseKernelAdapter], **kwargs: Any) -> BaseKernelAdapter:
+            with jit_phase("adapter", verbose=verbose, **phase_context):
+                return adapter_cls(**kwargs)
+
         # Create an adapter based on the specified execution backend.
         if execution_backend == "tvm_ffi":
             # Use TVMFFIKernelAdapter for interoperability with PyTorch via DLPack.
             # But we need to ensure that the runtime is enabled and the runtime module is not None.
             assert artifact.rt_mod is not None, "tvm_ffi backend requires a runtime module."
-            adapter = TVMFFIKernelAdapter(
+            adapter = create_adapter(
+                TVMFFIKernelAdapter,
                 params=artifact.params,
                 result_idx=out_idx,
                 target=target,
@@ -271,7 +308,8 @@ class JITKernel(Generic[_P, _T]):
                 compile_flags=compile_flags,
             )
         elif execution_backend == "cython":
-            adapter = CythonKernelAdapter(
+            adapter = create_adapter(
+                CythonKernelAdapter,
                 params=artifact.params,
                 result_idx=out_idx,
                 target=target,
@@ -286,7 +324,8 @@ class JITKernel(Generic[_P, _T]):
         elif execution_backend == "nvrtc":
             from tilelang.jit.adapter import NVRTCKernelAdapter
 
-            adapter = NVRTCKernelAdapter(
+            adapter = create_adapter(
+                NVRTCKernelAdapter,
                 params=artifact.params,
                 result_idx=out_idx,
                 target=target,
@@ -300,7 +339,8 @@ class JITKernel(Generic[_P, _T]):
             )
         elif execution_backend == "torch":
             assert is_metal_target(target)
-            adapter = MetalKernelAdapter(
+            adapter = create_adapter(
+                MetalKernelAdapter,
                 params=artifact.params,
                 result_idx=out_idx,
                 # target=target,
@@ -314,7 +354,8 @@ class JITKernel(Generic[_P, _T]):
             )
         elif execution_backend == "cutedsl":
             assert is_cutedsl_target(target)
-            adapter = CuTeDSLKernelAdapter(
+            adapter = create_adapter(
+                CuTeDSLKernelAdapter,
                 params=artifact.params,
                 result_idx=out_idx,
                 target=target,

@@ -207,7 +207,7 @@ LayoutMap InferSIMTLayout(const AtomicAddNode &op, const LayoutInferArgs &T,
 } // namespace
 
 struct AtomicAdd {
-  static Stmt LowerSIMT(const AtomicAddNode &op, const LowerArgs &T,
+  static Stmt LowerSIMT(const AtomicAddNode &op, const LowerArgs &lower_args,
                         arith::Analyzer *analyzer) {
     auto simt_loop = MakeSIMTLoop(op, analyzer);
     auto fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(simt_loop));
@@ -215,18 +215,20 @@ struct AtomicAdd {
     std::vector<InferLevel> levels = {InferLevel::kCommon, InferLevel::kStrict,
                                       InferLevel::kFree};
     for (auto level : levels) {
-      par_op->InferLayout({T.target,
-                           T.thread_bounds,
-                           T.layout_map,
+      par_op->InferLayout({lower_args.target,
+                           lower_args.thread_bounds,
+                           lower_args.layout_map,
                            analyzer,
-                           false,
-                           T.buffer_remap,
+                           lower_args.buffer_remap,
                            {}},
                           level);
     }
     auto loop_layout = par_op->GetLoopLayout();
-    return LowerParallelLoop(fused_loop, loop_layout, T.thread_var, analyzer,
-                             T.layout_map, par_op->GetPredicate(T.thread_var));
+    return LowerParallelLoop(fused_loop, loop_layout, lower_args.thread_index,
+                             analyzer, lower_args.layout_map,
+                             par_op->GetPredicate(lower_args.thread_index),
+                             /*parallel_loop=*/true, /*should_vectorize=*/true,
+                             par_op->LoopLayoutRequiresPaddingGuard());
   }
 
   static LayoutMap InferLayout(const AtomicAddNode &op,

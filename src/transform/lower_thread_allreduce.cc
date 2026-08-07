@@ -35,6 +35,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "backend/common/target_utils.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
 #include "tir/transforms/update_pointer_storage_scope.h"
@@ -392,6 +393,9 @@ private:
                         contiguous_reduce_extent)) {
       std::vector<PrimExpr> reduce_results;
       DataType mask_dtype = DataType::UInt(32);
+      if (target_ != nullptr && TargetIsMaca(GetRef<Target>(target_))) {
+        mask_dtype = DataType::UInt(64);
+      }
       PrimExpr mask = Call(mask_dtype, builtin::tvm_warp_activemask(), {});
 
       if (reduce_extent <= warp_size_) {
@@ -850,7 +854,7 @@ private:
   bool IsWarpReduction(const std::vector<DataType> &types, int group_extent,
                        int reduce_extent, int contiguous_reduce_extent) {
     if ((target_->kind->name != "cuda") && (target_->kind->name != "rocm") &&
-        (target_->kind->name != "metal")) {
+        (target_->kind->name != "metal") && (target_->kind->name != "maca")) {
       return false;
     }
 

@@ -81,7 +81,6 @@ struct CopyAnalysisContext {
   Target target;
   const LayoutMap *layout_map = nullptr;
   arith::Analyzer *analyzer = nullptr;
-  bool buffer_oob = false;
   bool emit_diagnostics = false;
 };
 
@@ -95,11 +94,6 @@ struct CopyInstSelection {
 // enforced here and reported through CopyInstSelection::reason.
 CopyInstSelection SelectCopyInstForLowering(const CopyNode &op,
                                             const CopyAnalysisContext &ctx);
-
-// Coarse pre-layout classification used by InstructionAnnotation.
-std::string ClassifyCopyForInstructionAnnotation(const CopyNode &op,
-                                                 Target target,
-                                                 bool in_pipeline);
 
 // Pre-layout producer classification used by warp-specialized scheduling.
 CopyInstSelection ClassifyWarpSpecializedProducerCopy(const CopyNode &op,

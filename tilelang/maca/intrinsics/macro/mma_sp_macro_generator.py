@@ -39,6 +39,7 @@ class SparseTensorCoreIntrinEmitter:
         "float16": "fp16",
         "bfloat16": "bf16",
         "float32": "fp32",
+        "float64": "fp64",
         "int8": "int8",
         "int32": "int32",
         "float8_e4m3": "e4m3",
@@ -71,10 +72,10 @@ class SparseTensorCoreIntrinEmitter:
 
     def __init__(
         self,
-        a_dtype: str = T.float16,
-        e_dtype: str = T.uint8,
-        b_dtype: str = T.float16,
-        accum_dtype: str = T.float16,
+        a_dtype: str = "float16",
+        e_dtype: str = "uint8",
+        b_dtype: str = "float16",
+        accum_dtype: str = "float16",
         a_transposed: bool = False,
         b_transposed: bool = False,
         e_transposed: bool = False,
@@ -119,14 +120,14 @@ class SparseTensorCoreIntrinEmitter:
                 f"Invalid threads configuration for this tile shape, {self.warp_rows} x {self.warp_cols} with threads {self.threads}"
             )
 
-    def _initialize_k_dim(self, a_dtype=T.float16):
+    def _initialize_k_dim(self, a_dtype="float16"):
         if isinstance(a_dtype, str):
             if a_dtype in ["float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz"]:
                 self.k_dim = 32
                 return
             a_dtype = DataType(a_dtype)
 
-        if a_dtype.bits == 32:
+        if a_dtype.bits == 64 or a_dtype.bits == 32:
             self.k_dim = 4
         elif a_dtype.bits in {16, 8}:
             self.k_dim = 16
@@ -151,6 +152,7 @@ class SparseTensorCoreIntrinEmitter:
             "bfloat16": "bf16",
             "float16": "f16",
             "float32": "f32",
+            "float64": "f64",
             "int8": "i8",
             "int32": "i32",
             "float8_e4m3fn": "fp8",
@@ -198,7 +200,10 @@ class SparseTensorCoreIntrinEmitter:
 
     def get_store_index_map(self, inverse: bool = False) -> IndexMap:
         warp_size, local_size_c = self.WARP_SIZE, self.local_size_out
-        index_map = IndexMap.from_func(mma_store_index_map, index_dtype=T.int32)
+        is_float64 = DataType(self.accum_dtype).bits == 64
+        index_map = IndexMap.from_func(
+            lambda thread_id, local_id: mma_store_index_map(thread_id, local_id, is_float64=is_float64), index_dtype=T.int32
+        )
         if not inverse:
             return index_map
         inverse_index_map = index_map.inverse([warp_size, local_size_c])
@@ -427,6 +432,7 @@ class SparseTensorCoreIntrinEmitter:
         assert C_buf_dims in {2, 4}, "C_buf should be 2D or 4D"
 
         thread_binding = self.get_thread_binding()
+        is_float64 = DataType(self.accum_dtype).bits == 64
 
         # STS
         # MMA Store must be in simulated instead of TVM Intrins
@@ -439,7 +445,7 @@ class SparseTensorCoreIntrinEmitter:
                 for local_id_o in T.serial(local_size_out // 2):
                     for local_id_i in T.vectorized(2):
                         local_id = local_id_o * 2 + local_id_i
-                        row, col = T.meta_var(mma_store_index_map(tx, local_id))
+                        row, col = T.meta_var(mma_store_index_map(tx, local_id, is_float64=is_float64))
                         if C_buf_dims == 2:
                             C_buf[(warp_m * warp_rows + i) * M_DIM + row, (warp_n * warp_cols + j) * n_dim + col] = C_local_buf[
                                 i * (warp_cols * local_size_out) + j * local_size_out + local_id
@@ -456,7 +462,7 @@ class SparseTensorCoreIntrinEmitter:
                 for local_id_o in T.serial(local_size_out // 2):
                     for local_id_i in T.vectorized(2):
                         local_id = local_id_o * 2 + local_id_i
-                        row, col = T.meta_var(mma_store_index_map(tx, local_id))
+                        row, col = T.meta_var(mma_store_index_map(tx, local_id, is_float64=is_float64))
                         C_buf[
                             (pid_m * BLOCK_M + warp_m * warp_rows + i) * M_DIM + row,
                             (pid_n * BLOCK_N + warp_n * warp_cols + j) * n_dim + col,

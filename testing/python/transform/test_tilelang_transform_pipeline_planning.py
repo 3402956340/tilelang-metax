@@ -2,6 +2,7 @@ from tilelang import tvm as tvm
 import tilelang as tl
 from tilelang.backend.target import determine_target
 import tilelang.language as T
+import tilelang.testing
 from tvm.tirx.stmt_functor import post_order_visit
 
 auto_target = tvm.target.Target(determine_target("auto"))
@@ -258,6 +259,8 @@ def test_pipeline_planning_before_after_mbarrier_arrive_wait_plan():
     _check(before, after, target=sm80_target)
 
 
+@tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
 def test_pipeline_planning_before_after_tma_copy_plan():
     @T.prim_func
     def before(A: T.Tensor((64,), T.float16), C: T.Tensor((64,), T.float16)):
@@ -314,6 +317,8 @@ def test_pipeline_planning_before_after_tma_copy_plan():
     _check(before, after, target=sm90_target)
 
 
+@tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
 def test_pipeline_planning_before_after_wgmma_gemm_plan():
     @T.prim_func
     def before(
@@ -388,6 +393,8 @@ def test_pipeline_planning_before_after_wgmma_gemm_plan():
     _check(before, after, target=sm90_target)
 
 
+@tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
 def test_pipeline_planning_before_after_tcgen05_gemm_plan():
     @T.prim_func
     def before(
@@ -796,3 +803,31 @@ def test_pipeline_planning_keeps_bind_that_reads_pipeline_written_buffer():
     assert stages == [0, 1, 1]
     assert orders == [0, 1, 2]
     assert replayable_binds == [1, 0, 0, 0]
+
+
+def test_pipeline_planning_keeps_bind_that_reads_atomic_target():
+    @T.prim_func
+    def before(
+        counter: T.Tensor((1,), T.int32),
+        out: T.Tensor((8,), T.int32),
+    ):
+        for i in T.Pipelined(
+            4,
+            order=[0, 1, 2, 3],
+            stage=[0, 0, 1, 1],
+        ):
+            snapshot: T.int32 = counter[0]
+            pos: T.int32 = T.atomic_add(counter[0], 1, return_prev=True)
+            out[i * 2] = snapshot
+            out[i * 2 + 1] = pos
+
+    mod = _run_pipeline_planning(before, sm80_target)
+    annos = _collect_pipeline_loop_annotations(mod["main"])
+    assert annos, "Expected at least one loop annotated by PipelinePlanning"
+    anno = annos[0]
+    stages = [int(v) for v in anno["software_pipeline_stage"]]
+    orders = [int(v) for v in anno["software_pipeline_order"]]
+
+    assert stages == [0, 0, 1, 1]
+    assert orders == [0, 1, 2, 3]
+    assert "software_pipeline_replayable_scalar_binds" not in anno

@@ -20,8 +20,6 @@ import tilelang.testing
 import pytest
 import torch
 
-SM100_TARGET = {"kind": "cuda", "arch": "sm_100"}
-SM80_TARGET = {"kind": "cuda", "arch": "sm_80"}
 DEFAULT_TARGET = tilelang.backend.target.determine_target(return_object=True)
 
 M = 128  # number of threads / element-pairs
@@ -141,6 +139,45 @@ def _make_auto_vec_fma_kernel(dtype_tl, width: int = 4):
     return main
 
 
+def _make_auto_vec_reduce_kernel(reduce_func, *, nan_propagate=False):
+    """Build a row reduction whose local fragment is contiguous per thread."""
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, 128), dtype=T.float32),
+        C: T.Tensor((M,), dtype=T.float32),
+    ):
+        with T.Kernel(1, 1, threads=M) as (bx, by):
+            src = T.alloc_fragment((M, 128), T.float32)
+            dst = T.alloc_fragment((M,), T.float32)
+            T.copy(A, src)
+            if nan_propagate:
+                reduce_func(src, dst, dim=1, nan_propagate=True)
+            else:
+                reduce_func(src, dst, dim=1)
+            T.copy(dst, C)
+
+    return main
+
+
+def _make_auto_vec_batched_reduce_kernel(reduce_func, *, rows=M, width=64, threads=256):
+    """Build a reduction that shuffles packed values between threads."""
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((rows, width), dtype=T.float32),
+        C: T.Tensor((rows,), dtype=T.float32),
+    ):
+        with T.Kernel(1, threads=threads):
+            src = T.alloc_shared((rows, width), T.float32)
+            dst = T.alloc_fragment((rows,), T.float32)
+            T.copy(A, src, disable_tma=True)
+            reduce_func(src, dst, dim=1, batch=2)
+            T.copy(dst, C)
+
+    return main
+
+
 # ===================================================================
 # Parametrised op / dtype lists
 # ===================================================================
@@ -158,7 +195,10 @@ _BINARY_OPS = [
 _DTYPES = ["float32", "bfloat16", "float16"]
 
 # Native cast types expected in codegen for 16-bit packed types
-_NATIVE_CAST_TYPE = {"bfloat16": "__nv_bfloat162", "float16": "__half2"}
+if DEFAULT_TARGET.kind.name == "maca":
+    _NATIVE_CAST_TYPE = {"bfloat16": "maca_bfloat162", "float16": "half2"}
+else:
+    _NATIVE_CAST_TYPE = {"bfloat16": "__nv_bfloat162", "float16": "__half2"}
 
 # Torch reference functions
 _TORCH_REFS = {
@@ -171,13 +211,34 @@ _TORCH_REFS = {
     "abs2": lambda a: torch.abs(a),
 }
 
+_REDUCE_OPS = [
+    ("sum", T.reduce_sum, ("add2",)),
+    ("abssum", T.reduce_abssum, ("add2", "abs2")),
+    ("max", T.reduce_max, ("max2",)),
+    ("min", T.reduce_min, ("min2",)),
+    ("absmax", T.reduce_absmax, ("max2", "abs2")),
+]
+
+
+def _torch_reduce(a, op_name):
+    if op_name == "sum":
+        return torch.sum(a, dim=1)
+    if op_name == "abssum":
+        return torch.sum(torch.abs(a), dim=1)
+    if op_name == "max":
+        return torch.max(a, dim=1).values
+    if op_name == "min":
+        return torch.min(a, dim=1).values
+    if op_name == "absmax":
+        return torch.max(torch.abs(a), dim=1).values
+    raise ValueError(f"Unsupported reduction: {op_name}")
+
 
 # ===================================================================
 # Codegen tests
 # ===================================================================
 
 
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 @pytest.mark.parametrize("dtype_name", _DTYPES)
 @pytest.mark.parametrize("op_name,op_func", _BINARY_OPS, ids=[n for n, _ in _BINARY_OPS])
@@ -193,7 +254,6 @@ def test_codegen_binary(op_name, op_func, dtype_name):
         assert _NATIVE_CAST_TYPE[dtype_name] in src, f"Expected {_NATIVE_CAST_TYPE[dtype_name]} cast in CUDA source for {dtype_name}"
 
 
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 @pytest.mark.parametrize("dtype_name", _DTYPES)
 def test_codegen_fma2(dtype_name):
@@ -206,7 +266,6 @@ def test_codegen_fma2(dtype_name):
         assert _NATIVE_CAST_TYPE[dtype_name] in src, f"Expected {_NATIVE_CAST_TYPE[dtype_name]} cast in CUDA source for {dtype_name}"
 
 
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 @pytest.mark.parametrize("dtype_name", _DTYPES)
 def test_codegen_abs2(dtype_name):
@@ -227,31 +286,31 @@ _AUTO_VEC_OP_NAMES = list(_AUTO_VEC_OPS.keys())  # ["add", "sub", "mul"]
 
 
 # float32: auto-vectorization should emit tl::<op>2 on SM100+
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 @pytest.mark.parametrize("op_key", _AUTO_VEC_OP_NAMES)
 def test_codegen_auto_vec_f32(op_key):
     py_op, tl_func = _AUTO_VEC_OPS[op_key]
     func = _make_auto_vec_binary_kernel(py_op, T.float32)
-    src = _lower_to_cuda_source(func, target=SM100_TARGET)
+    src = _lower_to_cuda_source(func)
     assert f"tl::{tl_func}" in src, f"Expected tl::{tl_func} in SM100 auto-vectorised CUDA source for float32 {op_key}"
 
 
 @tilelang.testing.requires_cuda
-@tilelang.testing.requires_cuda_compute_version(10)
 @pytest.mark.parametrize("op_key", _AUTO_VEC_OP_NAMES)
 def test_codegen_auto_vec_f32_width8(op_key):
     py_op, tl_func = _AUTO_VEC_OPS[op_key]
     func = _make_auto_vec_binary_kernel(py_op, T.float32, width=8)
-    src = _lower_to_cuda_source(func, target=SM100_TARGET)
+    src = _lower_to_cuda_source(func)
+    fields = "xz" if DEFAULT_TARGET.kind.name == "maca" else "xyzw"
     assert "\x00" not in src, "Generated CUDA source should not contain embedded NUL bytes"
-    for field in "xyzw":
+    for field in fields:
         assert f".{field})) = tl::{tl_func}(" in src, (
             f"Expected {field}-field packed tl::{tl_func} emission in width-8 float32 auto-vectorised source"
         )
 
 
 # float32: auto-vectorization should NOT emit tl::<op>2 before SM100
+@tilelang.testing.skip_on_maca
 @tilelang.testing.requires_cuda
 @pytest.mark.parametrize("op_key", _AUTO_VEC_OP_NAMES)
 def test_codegen_auto_vec_f32_no_sm80(op_key):
@@ -261,15 +320,45 @@ def test_codegen_auto_vec_f32_no_sm80(op_key):
     assert f"tl::{tl_func}" not in src, f"tl::{tl_func} should NOT appear in SM80 auto-vectorised CUDA source for float32 {op_key}"
 
 
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 def test_codegen_auto_vec_fma_f32():
     func = _make_auto_vec_fma_kernel(T.float32)
-    src = _lower_to_cuda_source(func, target=SM100_TARGET)
+    src = _lower_to_cuda_source(func)
     assert "tl::fma2" in src, "Expected tl::fma2 in SM100 auto-vectorised CUDA source for float32 mul+add"
 
 
-@tilelang.testing.pytest.mark.xfail
+@tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize("op_name,reduce_func,packed_ops", _REDUCE_OPS, ids=[op[0] for op in _REDUCE_OPS])
+def test_codegen_auto_vec_reduce_f32_sm100(op_name, reduce_func, packed_ops):
+    func = _make_auto_vec_reduce_kernel(reduce_func)
+    src = _lower_to_cuda_source(func)
+    for packed_op in packed_ops:
+        assert f"tl::{packed_op}" in src, f"Expected tl::{packed_op} in SM100 float32 {op_name} reduction"
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize("op_name,reduce_func,packed_ops", _REDUCE_OPS, ids=[op[0] for op in _REDUCE_OPS])
+def test_codegen_auto_vec_reduce_f32_no_sm80(op_name, reduce_func, packed_ops):
+    func = _make_auto_vec_reduce_kernel(reduce_func)
+    src = _lower_to_cuda_source(func)
+    for packed_op in packed_ops:
+        assert f"tl::{packed_op}" not in src, f"tl::{packed_op} should not appear in pre-SM100 float32 {op_name} reduction"
+
+
+@tilelang.testing.skip_on_maca
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize(
+    "reduce_func,packed_op",
+    [(T.reduce_max, "max2"), (T.reduce_min, "min2"), (T.reduce_absmax, "max2")],
+)
+def test_codegen_auto_vec_reduce_f32_ignores_half_nan_mode(reduce_func, packed_op):
+    func = _make_auto_vec_reduce_kernel(reduce_func, nan_propagate=True)
+    src = _lower_to_cuda_source(func)
+    assert f"tl::{packed_op}" in src
+    assert f"tl::{packed_op}_nan" not in src
+
+
 @tilelang.testing.requires_cuda
 @pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
 def test_codegen_auto_vec_fma_half_types(dtype_name):
@@ -282,7 +371,6 @@ def test_codegen_auto_vec_fma_half_types(dtype_name):
 
 # bfloat16 / float16: auto-vectorization should emit tl::<op>2 on any target
 # (the C++ helpers have compile-time arch fallbacks).
-@tilelang.testing.pytest.mark.xfail
 @tilelang.testing.requires_cuda
 @pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
 @pytest.mark.parametrize("op_key", _AUTO_VEC_OP_NAMES)
@@ -337,6 +425,28 @@ def test_correctness_fma2(dtype_name):
         torch.testing.assert_close(d, ref)
     else:
         torch.testing.assert_close(d, ref, atol=1e-2, rtol=1e-1)
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(10)
+@pytest.mark.parametrize("op_name,reduce_func", [(op_name, reduce_func) for op_name, reduce_func, _ in _REDUCE_OPS])
+def test_correctness_auto_vec_reduce_f32(op_name, reduce_func):
+    func = _make_auto_vec_reduce_kernel(reduce_func)
+    kernel = tilelang.compile(func, out_idx=[1], target="cuda")
+    a = torch.randn((M, 128), device="cuda", dtype=torch.float32)
+    result = kernel(a)
+    reference = _torch_reduce(a, op_name)
+    torch.testing.assert_close(result, reference, atol=1e-5, rtol=1e-5)
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(10)
+def test_correctness_auto_vec_batched_reduce_f32():
+    func = _make_auto_vec_batched_reduce_kernel(T.reduce_sum)
+    kernel = tilelang.compile(func, out_idx=[1], target="cuda")
+    a = torch.randn((M, 64), device="cuda", dtype=torch.float32)
+    result = kernel(a)
+    torch.testing.assert_close(result, torch.sum(a, dim=1), atol=1e-5, rtol=1e-5)
 
 
 @tilelang.testing.requires_cuda
