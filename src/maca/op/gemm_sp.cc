@@ -26,23 +26,23 @@ namespace maca {
 namespace {
 
 constexpr const char *kMacaMMASP = "maca.mma.sp";
+constexpr const char *kMacaMMASPM8N8 = "maca.mma.sp.m8n8";
 
 std::pair<int, int>
 ComputeDefaultWarpPartition(const GemmSPWarpPolicyNode &policy, int M, int N,
-                            int num_warps, int k_n_per_warp) {
+                            int num_warps, int k_m_per_warp, int k_n_per_warp) {
   int m_warp = 1, n_warp = 1;
-  constexpr int kMPerWarp = 16;
 
-  ICHECK(M % kMPerWarp == 0)
-      << "M must be divisible by " << kMPerWarp << ", but got " << M;
+  ICHECK(M % k_m_per_warp == 0)
+      << "M must be divisible by " << k_m_per_warp << ", but got " << M;
   ICHECK(N % k_n_per_warp == 0)
       << "N must be divisible by " << k_n_per_warp << ", but got " << N;
 
   if (policy.IsFullRow()) {
     m_warp = num_warps;
     n_warp = 1;
-    if (M % (m_warp * kMPerWarp) != 0) {
-      int max_m_warps = M / kMPerWarp;
+    if (M % (m_warp * k_m_per_warp) != 0) {
+      int max_m_warps = M / k_m_per_warp;
       m_warp = max_m_warps;
       n_warp = num_warps / m_warp;
       if (n_warp == 0)
@@ -59,7 +59,7 @@ ComputeDefaultWarpPartition(const GemmSPWarpPolicyNode &policy, int M, int N,
         m_warp = 1;
     }
   } else if (policy.IsSquare()) {
-    int max_m_warps = M / kMPerWarp;
+    int max_m_warps = M / k_m_per_warp;
     float ideal_ratio = N > 0 ? static_cast<float>(M) / N : 1.0f;
 
     int best_m = 1;
@@ -68,7 +68,7 @@ ComputeDefaultWarpPartition(const GemmSPWarpPolicyNode &policy, int M, int N,
     for (int m = 1; m <= max_m_warps && m <= num_warps; m++) {
       int n = num_warps / m;
 
-      float m_per_warp = static_cast<float>(M) / (m * kMPerWarp);
+      float m_per_warp = static_cast<float>(M) / (m * k_m_per_warp);
       float n_per_warp = static_cast<float>(N) / (n * k_n_per_warp);
       if (m_per_warp < 1 || n_per_warp < 1)
         continue;
@@ -102,23 +102,31 @@ ComputeDefaultWarpPartition(const GemmSPWarpPolicyNode &policy, int M, int N,
 struct GemmSP {
   static String SelectInst(const GemmSPNode &op, int block_size,
                            Target target) {
-    return kMacaMMASP;
+    if (op.M % 16 == 0 && op.N % 16 == 0) {
+      return kMacaMMASP;
+    }
+    ICHECK(op.M % 8 == 0 && op.N % 8 == 0)
+        << "MACA gemm_sp requires M and N divisible by 8, got M=" << op.M
+        << " N=" << op.N;
+    return kMacaMMASPM8N8;
   }
 
   static std::pair<int, int>
   ComputeWarpPartition(const GemmSPWarpPolicyNode &policy, int M, int N,
                        int block_size, Target target, String gemm_inst) {
     int num_warps = block_size / TargetMacaGetWarpSize(target);
-    int k_n_per_warp = 16;
-    return ComputeDefaultWarpPartition(policy, M, N, num_warps, k_n_per_warp);
+    if (gemm_inst == kMacaMMASPM8N8) {
+      return ComputeDefaultWarpPartition(policy, M, N, num_warps, 8, 8);
+    }
+    return ComputeDefaultWarpPartition(policy, M, N, num_warps, 16, 16);
   }
 
   static bool ReuseExistingSharedLayout(String gemm_inst) {
-    return gemm_inst == kMacaMMASP;
+    return gemm_inst == kMacaMMASP || gemm_inst == kMacaMMASPM8N8;
   }
 
   static String InstructionKind(String gemm_inst) {
-    if (gemm_inst == kMacaMMASP) {
+    if (gemm_inst == kMacaMMASP || gemm_inst == kMacaMMASPM8N8) {
       return "mma.sp";
     }
     return "unknown";
