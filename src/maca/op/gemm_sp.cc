@@ -30,19 +30,19 @@ constexpr const char *kMacaMMASPM8N8 = "maca.mma.sp.m8n8";
 
 std::pair<int, int>
 ComputeDefaultWarpPartition(const GemmSPWarpPolicyNode &policy, int M, int N,
-                            int num_warps, int k_m_per_warp, int k_n_per_warp) {
+                            int num_warps, int kMPerWarp, int k_n_per_warp) {
   int m_warp = 1, n_warp = 1;
 
-  ICHECK(M % k_m_per_warp == 0)
-      << "M must be divisible by " << k_m_per_warp << ", but got " << M;
+  ICHECK(M % kMPerWarp == 0)
+      << "M must be divisible by " << kMPerWarp << ", but got " << M;
   ICHECK(N % k_n_per_warp == 0)
       << "N must be divisible by " << k_n_per_warp << ", but got " << N;
 
   if (policy.IsFullRow()) {
     m_warp = num_warps;
     n_warp = 1;
-    if (M % (m_warp * k_m_per_warp) != 0) {
-      int max_m_warps = M / k_m_per_warp;
+    if (M % (m_warp * kMPerWarp) != 0) {
+      int max_m_warps = M / kMPerWarp;
       m_warp = max_m_warps;
       n_warp = num_warps / m_warp;
       if (n_warp == 0)
@@ -59,7 +59,7 @@ ComputeDefaultWarpPartition(const GemmSPWarpPolicyNode &policy, int M, int N,
         m_warp = 1;
     }
   } else if (policy.IsSquare()) {
-    int max_m_warps = M / k_m_per_warp;
+    int max_m_warps = M / kMPerWarp;
     float ideal_ratio = N > 0 ? static_cast<float>(M) / N : 1.0f;
 
     int best_m = 1;
@@ -68,7 +68,7 @@ ComputeDefaultWarpPartition(const GemmSPWarpPolicyNode &policy, int M, int N,
     for (int m = 1; m <= max_m_warps && m <= num_warps; m++) {
       int n = num_warps / m;
 
-      float m_per_warp = static_cast<float>(M) / (m * k_m_per_warp);
+      float m_per_warp = static_cast<float>(M) / (m * kMPerWarp);
       float n_per_warp = static_cast<float>(N) / (n * k_n_per_warp);
       if (m_per_warp < 1 || n_per_warp < 1)
         continue;
